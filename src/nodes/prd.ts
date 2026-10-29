@@ -15,16 +15,26 @@ import { renderWorkOrder } from '../prompts/loader.js';
 import { getDocsDir } from '../runtime/paths.js';
 import type { TBCItem } from '../state/types.js';
 import { answerSummary, askWorkerQuestion, recordWorkerQuestion } from './stage-gates.js';
+import {
+  artifactsOf,
+  collectedSummary,
+  readPrdInputs,
+  writeCollectedInputs,
+} from './prd-inputs.js';
+import type { CollectedInputs } from './prd-inputs.js';
 
 /**
  * The PRD stage: the requirements come from the user, not from the model.
  *
  * The stage asks three times, one question per execution:
  *
- * 1. `collect_prd` (the user): the PRD and - optionally - the URL of a
- *    Figma file. **The PRD is never written before the user provided it**: a
- *    model that invents the requirements and then asks for a correction
- *    produces a document the user has to fight with, not one they wrote.
+ * 1. `collect_prd` (the user): **everything the requirement needs, in one
+ *    go** - the PRD (a file path or a text), the design (a Figma link or a
+ *    description in words) and any other documents the user wants the spec
+ *    writer to read. **The PRD is never written before the user provided
+ *    it**: a model that invents the requirements and then asks for a
+ *    correction produces a document the user has to fight with, not one they
+ *    wrote.
  * 2. `figma_fetch` (the host): only when the user gave a Figma URL. The
  *    graph does not talk to Figma - the **current Claude Code session**
  *    does, with the MCP tools it already has. A worker that needs a human
@@ -44,6 +54,28 @@ const STAGE = 'prd';
 
 /** The step that holds the Figma URL of the current PRD. */
 const STEP_FIGMA_URL = 'figma-url';
+
+/**
+ * The step that holds the design decision of the current PRD.
+ *
+ * `url` —— the user gave a Figma link; the P0 files are fetched.
+ * `text` —— the user described the design in words.
+ * `none` —— there is no design.
+ *
+ * **The spec stage reads it so that it does not ask about the design a
+ * second time.** A run that has no decision recorded is an older run, and
+ * it keeps the old behaviour.
+ */
+export const STEP_DESIGN = 'design';
+
+/**
+ * The stage that recorded the design decision.
+ *
+ * The spec stage reads it from here: the decision was made once, at the
+ * `collect_prd` gate, and the spec stage must not ask about the design a
+ * second time.
+ */
+export const DESIGN_STAGE = STAGE;
 
 /** The step that records that the Figma work order was answered. */
 const STEP_FIGMA_DONE = 'figma-done';
@@ -165,14 +197,41 @@ export async function prdNode(state: GraphState): Promise<NodeOutcome> {
 
   // ---- Step 1: the requirements come from the user ----------------------
   if (!hasStageStep(state, STAGE, collectedStep(gen))) {
-    const answer = interrupt(collectPrdPayload());
-    const prdMarkdown = readPrdMarkdown(answer);
-    writePrd(docsDirOf(state), prdMarkdown);
+    const answer = interrupt(collectPrdPayload(collectDiagnostic(state, gen)));
+
+    // The answer has to have a PRD. A shape the gate never asked for is a
+    // mistake of the host, and it is loud about it: the gate shows the shape
+    // it wants, so an answer that does not fit it has to be said out loud
+    // rather than asked again silently.
+    const inputs = readPrdInputs(answer);
+
+    let collected: CollectedInputs;
+    try {
+      collected = writeCollectedInputs(docsDirOf(state), inputs);
+    } catch (err) {
+      // **A file the user pointed at cannot be read.** That is the user's
+      // mistake, not the host's - so the gate asks again, with the reason,
+      // instead of the run dying on it.
+      return {
+        kind: 'advance',
+        update: recordStageStep(STAGE, collectFailedStep(gen), errorMessage(err)),
+        goto: STAGE,
+      };
+    }
+
     const update = recordStageStep(STAGE, collectedStep(gen), '');
     update.stageSteps = {
       ...(update.stageSteps ?? {}),
-      ...(recordStageStep(STAGE, STEP_FIGMA_URL, readFigmaUrl(answer)).stageSteps ?? {}),
+      // The design decision: the spec stage must not ask about the design
+      // again when the user already answered it here.
+      ...(recordStageStep(STAGE, STEP_DESIGN, collected.design).stageSteps ?? {}),
+      ...(recordStageStep(STAGE, collectSummaryStep(gen), JSON.stringify(collectedSummary(collected)))
+        .stageSteps ?? {}),
+      ...(collected.figmaUrl !== undefined
+        ? (recordStageStep(STAGE, STEP_FIGMA_URL, collected.figmaUrl).stageSteps ?? {})
+        : {}),
     };
+    update.artifacts = { ...(update.artifacts ?? {}), ...artifactsOf(collected.files) };
     return { kind: 'advance', update, goto: STAGE };
   }
 
@@ -218,7 +277,14 @@ export async function prdNode(state: GraphState): Promise<NodeOutcome> {
   if (gate !== undefined) return gate;
 
   // ---- Step 4: the confirmation -----------------------------------------
-  const answer = interrupt({ audience: 'user', type: 'confirm_prd' });
+  // The payload says **what the graph actually collected** - the PRD came
+  // from this file, the design was described in these words, these other
+  // documents were read. The user approves without having to guess.
+  const answer = interrupt({
+    audience: 'user',
+    type: 'confirm_prd',
+    collected: collectedSummaryOf(state),
+  });
   if (!isApproved(answer)) {
     // The user does not want this PRD: the next generation collects it
     // again.
@@ -238,57 +304,79 @@ export async function prdNode(state: GraphState): Promise<NodeOutcome> {
 /**
  * The payload of the gate that asks for the requirements.
  *
- * The payload names the shape of the answer: the host has to know which
- * fields it has to send, and the node has to be able to say so when the
- * answer does not have that shape.
+ * The payload carries the **questions** (the host asks them) and the
+ * **shape of the answer** (the host builds it). Three things are asked for
+ * in one go, so the requirement is not pieced together across three
+ * interruptions:
+ *
+ * 1. the PRD - a file path or the text itself,
+ * 2. the design - a Figma link or a description in words,
+ * 3. the other documents - optional.
+ *
+ * @param diagnostic - Why the last answer could not be used, if it could
+ *   not. The gate asks again with the reason, so the user knows which of
+ *   their answers went wrong.
  */
-function collectPrdPayload(): InterruptPayload {
+function collectPrdPayload(diagnostic?: string): InterruptPayload {
   return {
     audience: 'user',
     type: 'collect_prd',
+    question: [
+      '1. **PRD** —— 這次要做什麼？給一個文件路徑（圖自己去讀），或直接用文字描述。',
+      '2. **Figma** —— 設計檔連結，或用文字描述設計；沒有設計就說沒有。',
+      '3. **其他文件** —— 要讓規格階段一起讀的文件（選填，給路徑或文字）。',
+    ].join('\n'),
     answer: {
-      prdMarkdown: '<the requirements, as markdown>',
-      figmaUrl: '<the URL of the Figma file (optional)>',
+      prd: '<the requirements, as markdown> | { "path": "/absolute/path/to/PRD.md" }',
+      figma:
+        '<the URL of the Figma file> | { "url": "<the URL>" } | { "text": "<the design, in words>" } | null',
+      docs: ['{ "path": "/absolute/path/to/other.md" } | { "name": "other.md", "text": "..." }'],
     },
+    ...(diagnostic !== undefined ? { note: diagnostic } : {}),
   };
 }
 
 /**
- * The PRD of the answer.
+ * The diagnostic of the last answer that could not be used.
  *
- * @throws Error when the answer has a shape the node does not understand.
- *   Asking the same question again and again without saying why would be
- *   worse than failing: the user would never learn what is wrong.
+ * @param state - The graph state.
+ * @param gen - The generation of the stage.
+ * @returns The reason, or `undefined` when there was none.
  */
-function readPrdMarkdown(answer: unknown): string {
-  if (typeof answer === 'string' && answer.trim() !== '') {
-    return answer.trim();
-  }
-  if (typeof answer === 'object' && answer !== null) {
-    const markdown = (answer as { prdMarkdown?: unknown }).prdMarkdown;
-    if (typeof markdown === 'string' && markdown.trim() !== '') {
-      return markdown.trim();
-    }
-  }
-  throw new Error(
-    'the collect_prd gate expects an answer of the shape ' +
-      '{"prdMarkdown": "<the requirements, as markdown>", "figmaUrl": "<the Figma file (optional)>"} ' +
-      '(the markdown itself is accepted as well), ' +
-      `but got ${JSON.stringify(answer)}`
-  );
+function collectDiagnostic(state: GraphState, gen: number): string | undefined {
+  const raw = readStageStep(state, STAGE, collectFailedStep(gen));
+  return raw === undefined || raw === '' ? undefined : raw;
 }
 
-/** The Figma URL of the answer (empty when there is none). */
-function readFigmaUrl(answer: unknown): string {
-  if (typeof answer !== 'object' || answer === null) return '';
-  return answerText(answer, 'figmaUrl');
+/** The step that records a failed collection of a generation. */
+function collectFailedStep(gen: number): string {
+  return `collect-failed-${gen}`;
 }
 
-/** Write the PRD the user gave. */
-function writePrd(docsDir: string, markdown: string): void {
-  fs.mkdirSync(docsDir, { recursive: true });
-  const text = markdown.endsWith('\n') ? markdown : `${markdown}\n`;
-  fs.writeFileSync(path.join(docsDir, 'prd.md'), text, 'utf-8');
+/** The step that holds what was collected, for the confirmation gate. */
+function collectSummaryStep(gen: number): string {
+  return `collect-summary-${gen}`;
+}
+
+/**
+ * What the graph collected, as the confirmation gate shows it.
+ *
+ * @param state - The graph state.
+ * @returns The summary, or `undefined` when there is none.
+ */
+function collectedSummaryOf(state: GraphState): Record<string, unknown> | undefined {
+  const raw = readStageStep(state, STAGE, collectSummaryStep(stageGeneration(state, STAGE)));
+  if (raw === undefined || raw === '') return undefined;
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The message of an error. */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**

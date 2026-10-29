@@ -14,8 +14,16 @@ import {
 } from '../graph/state.js';
 import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.js';
 import { actionOf } from '../nodes/bootstrap.js';
-import { checkFigmaP0, FIGMA_P0_FILES, figmaTbcItem, figmaWorkOrder } from '../nodes/prd.js';
+import {
+  checkFigmaP0,
+  DESIGN_STAGE,
+  FIGMA_P0_FILES,
+  figmaTbcItem,
+  figmaWorkOrder,
+  STEP_DESIGN,
+} from '../nodes/prd.js';
 import { parseAcIds, parseQuestions, parseTbcItems } from '../parsers/ids.js';
+import { DESIGN_FILE, REFS_DIR } from '../nodes/prd-inputs.js';
 import { renderWorkOrder } from '../prompts/loader.js';
 import { getDocsDir, readDoc } from '../runtime/paths.js';
 import type { SpecQuestion, TBCItem } from '../state/types.js';
@@ -200,7 +208,7 @@ async function specNodeImpl(state: GraphState): Promise<NodeOutcome> {
     return { kind: 'advance', update, goto: STAGE };
   }
 
-  if (p0 === STEP_FIGMA_MISSING) {
+  if (p0 === STEP_FIGMA_MISSING && worthAskingAboutTheDesign(state)) {
     const decision = figmaDecision(state);
     if (decision === undefined) {
       const answer = interrupt({
@@ -495,10 +503,15 @@ export function specWorkOrder(
   note?: string
 ): InterruptPayload {
   const inputs = [path.join(docsDir, 'prd.md')];
+  // A design the user described in words is part of the requirement.
+  const design = path.join(docsDir, DESIGN_FILE);
+  if (fs.existsSync(design)) inputs.push(design);
   for (const relative of FIGMA_P0_FILES) {
     const file = path.join(docsDir, relative);
     if (fs.existsSync(file)) inputs.push(file);
   }
+  // The other documents the user gave are reference material for the spec.
+  for (const file of referenceFiles(docsDir)) inputs.push(file);
   const claudeMd = path.join(repoDir, 'CLAUDE.md');
   if (fs.existsSync(claudeMd)) inputs.push(claudeMd);
 
@@ -530,6 +543,45 @@ export function specWorkOrder(
 /** Where the requirement documents of the run live. */
 function docsDirOf(state: GraphState): string {
   return getDocsDir(state.requirementName, state.repoPath);
+}
+
+/**
+ * The reference documents the user gave at the `collect_prd` gate.
+ *
+ * @param docsDir - The requirement directory of the run.
+ * @returns The files in `refs/`, sorted by name.
+ */
+function referenceFiles(docsDir: string): string[] {
+  const dir = path.join(docsDir, REFS_DIR);
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((name) => fs.statSync(path.join(dir, name)).isFile())
+    .sort()
+    .map((name) => path.join(dir, name));
+}
+
+/**
+ * Is the design worth asking about again?
+ *
+ * **The user already answered this at the `collect_prd` gate.** The prd
+ * stage recorded what they said: a Figma link (`url`), a description in
+ * words (`text`) or nothing (`none`).
+ *
+ * - `url` —— the P0 files are missing, so the fetch did not work. That is
+ *   worth asking about: fetch again, turn it into a TBC, or skip.
+ * - `text` —— the design is in words. There is nothing to fetch, and asking
+ *   again would only make the user answer the same question twice.
+ * - `none` —— there is no design. Same thing.
+ * - nothing recorded —— an older run, which never had the question. It
+ *   keeps the old behaviour and asks.
+ *
+ * @param state - The graph state.
+ */
+function worthAskingAboutTheDesign(state: GraphState): boolean {
+  const decision = readStageStep(state, DESIGN_STAGE, STEP_DESIGN);
+  if (decision === 'text' || decision === 'none') return false;
+  return true;
 }
 
 /**

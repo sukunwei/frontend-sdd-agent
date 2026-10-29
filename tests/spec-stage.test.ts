@@ -127,7 +127,7 @@ describe('Spec 節點', () => {
   });
 
   /** The real spec node behind a fake bootstrap. */
-  function specGraph(): { g: any; cfg: any } {
+  function specGraph(opts: { design?: 'url' | 'text' | 'none' } = {}): { g: any; cfg: any } {
     const g = buildGraph({
       checkpointer: createCheckpointer(path.join(dir, 'cp.sqlite')),
       testNodes: {
@@ -138,6 +138,11 @@ describe('Spec 節點', () => {
             currentStage: 'spec',
             requirementName: 'demo',
             repoPath: repoDir,
+            // The design decision the prd stage recorded. Without it the
+            // spec stage keeps the old behaviour and asks.
+            ...(opts.design !== undefined
+              ? { stageSteps: { 'prd/design': opts.design } }
+              : {}),
           },
           goto: 'spec',
         }),
@@ -160,6 +165,48 @@ describe('Spec 節點', () => {
     expect(payload.audience).toBe('user');
     expect(payload.type).toBe('figma_missing');
     expect(payload.options).toEqual(['fetch', 'tbc', 'skip']);
+  });
+
+  it('使用者說了沒有設計時不得再問一次', async () => {
+    const { g, cfg } = specGraph({ design: 'none' });
+    await g.invoke({ requirementName: 'demo' }, cfg);
+
+    // 設計的事在 collect_prd 就問過了：不得再問第二次。
+    const payload = await pending(g, cfg);
+    expect(payload.audience).toBe('host');
+    expect(payload.role).toBe('spec_writer');
+  });
+
+  it('設計是用文字描述時不得再問一次', async () => {
+    const { g, cfg } = specGraph({ design: 'text' });
+    await g.invoke({ requirementName: 'demo' }, cfg);
+
+    const payload = await pending(g, cfg);
+    expect(payload.role).toBe('spec_writer');
+  });
+
+  it('使用者給了 Figma 連結但抓不到檔案時照舊要問', async () => {
+    const { g, cfg } = specGraph({ design: 'url' });
+    await g.invoke({ requirementName: 'demo' }, cfg);
+
+    const payload = await pending(g, cfg);
+    expect(payload.audience).toBe('user');
+    expect(payload.type).toBe('figma_missing');
+  });
+
+  it('spec 工作單必須讀設計說明與其他文件', async () => {
+    fs.writeFileSync(path.join(docsDir, 'design.md'), '# 設計\n', 'utf-8');
+    fs.mkdirSync(path.join(docsDir, 'refs'), { recursive: true });
+    fs.writeFileSync(path.join(docsDir, 'refs', 'api.md'), '# API\n', 'utf-8');
+
+    const { g, cfg } = specGraph({ design: 'text' });
+    await g.invoke({ requirementName: 'demo' }, cfg);
+
+    const payload = await pending(g, cfg);
+    expect(payload.role).toBe('spec_writer');
+    expect(payload.inputs).toContain(path.join(docsDir, 'prd.md'));
+    expect(payload.inputs).toContain(path.join(docsDir, 'design.md'));
+    expect(payload.inputs).toContain(path.join(docsDir, 'refs', 'api.md'));
   });
 
   it('選了 fetch 但沒有 Figma 網址時不得發無用的工作單', async () => {

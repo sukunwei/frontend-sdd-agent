@@ -97,9 +97,14 @@ describe('PRD 節點', () => {
     const payload = await pending(g, cfg);
     expect(payload.audience).toBe('user');
     expect(payload.type).toBe('collect_prd');
+    // 閘門必須問出三件事：PRD、設計、其他文件
+    expect(payload.question).toContain('PRD');
+    expect(payload.question).toContain('Figma');
+    expect(payload.question).toContain('其他文件');
     // 閘門必須說清楚答案的形狀
-    expect(payload.answer.prdMarkdown).toBeTypeOf('string');
-    expect(payload.answer.figmaUrl).toBeTypeOf('string');
+    expect(payload.answer.prd).toBeTypeOf('string');
+    expect(payload.answer.figma).toBeTypeOf('string');
+    expect(payload.answer.docs).toBeInstanceOf(Array);
     expect(fs.existsSync(prdPath)).toBe(false);
   });
 
@@ -111,12 +116,107 @@ describe('PRD 節點', () => {
     expect(fs.readFileSync(prdPath, 'utf-8')).toContain('要有一個 QR code 產生器');
   });
 
+  it('PRD 給路徑時圖自己去讀，內容原封不動寫進 prd.md', async () => {
+    const source = path.join(dir, 'PRD.md');
+    fs.writeFileSync(source, '# 我的 PRD\n\n要一個問候函式\n', 'utf-8');
+
+    const { g, cfg } = prdGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    await g.invoke(new Command({ resume: { prd: { path: source } } }), cfg);
+
+    expect(fs.readFileSync(prdPath, 'utf-8')).toBe('# 我的 PRD\n\n要一個問候函式\n');
+    const snap: any = await g.getState(cfg);
+    expect(snap.values.artifacts.prd.path).toBe(prdPath);
+  });
+
+  it('路徑讀不到時要帶著診斷再問一次，不得把整輪弄死', async () => {
+    const missing = path.join(dir, 'nope.md');
+    const { g, cfg } = prdGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    await g.invoke(new Command({ resume: { prd: { path: missing } } }), cfg);
+
+    // 閘門再問一次，而且帶著診斷：使用者看得見是哪個路徑出問題
+    const gate = await pending(g, cfg);
+    expect(gate.type).toBe('collect_prd');
+    expect(gate.note).toContain('nope.md');
+    // 壞掉的答案不得留下半份 PRD
+    expect(fs.existsSync(prdPath)).toBe(false);
+
+    // 這一次給對了 → 收下
+    const good = path.join(dir, 'good.md');
+    fs.writeFileSync(good, '# 對的那份\n', 'utf-8');
+    await g.invoke(new Command({ resume: { prd: { path: good } } }), cfg);
+    expect(fs.readFileSync(prdPath, 'utf-8')).toContain('對的那份');
+  });
+
+  it('設計用文字描述時寫成 design.md，不發 figma_fetch 工作單', async () => {
+    const { g, cfg } = prdGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    await g.invoke(
+      new Command({ resume: { prd: '# PRD', figma: { text: '一張藍色的卡片' } } }),
+      cfg
+    );
+
+    // 沒有 Figma 連結 → 不發抓取工作單，直接問確認
+    const gate = await pending(g, cfg);
+    expect(gate.type).toBe('confirm_prd');
+    expect(gate.collected.design.kind).toBe('text');
+    expect(fs.readFileSync(path.join(docsDir, 'design.md'), 'utf-8')).toContain('一張藍色的卡片');
+  });
+
+  it('其他文件會被複製到 refs/，並記進 artifacts', async () => {
+    const source = path.join(dir, 'api.md');
+    fs.writeFileSync(source, '# API\n\nGET /users\n', 'utf-8');
+
+    const { g, cfg } = prdGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    await g.invoke(new Command({ resume: { prd: '# PRD', docs: [{ path: source }] } }), cfg);
+
+    expect(fs.readFileSync(path.join(docsDir, 'refs', 'api.md'), 'utf-8')).toContain('GET /users');
+    const snap: any = await g.getState(cfg);
+    expect(Object.keys(snap.values.artifacts)).toContain('refs/api.md');
+    // 其他文件不得變成 PRD
+    expect(fs.readFileSync(prdPath, 'utf-8')).not.toContain('GET /users');
+  });
+
+  it('其他文件也可以直接給文字', async () => {
+    const { g, cfg } = prdGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    await g.invoke(
+      new Command({ resume: { prd: '# PRD', docs: [{ name: 'note.md', text: '# 附註\n' }] } }),
+      cfg
+    );
+
+    expect(fs.readFileSync(path.join(docsDir, 'refs', 'note.md'), 'utf-8')).toContain('# 附註');
+  });
+
+  it('同名的其他文件不得互相覆蓋', async () => {
+    const a = path.join(dir, 'a', 'note.md');
+    const b = path.join(dir, 'b', 'note.md');
+    fs.mkdirSync(path.dirname(a), { recursive: true });
+    fs.mkdirSync(path.dirname(b), { recursive: true });
+    fs.writeFileSync(a, '# 甲\n', 'utf-8');
+    fs.writeFileSync(b, '# 乙\n', 'utf-8');
+
+    const { g, cfg } = prdGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    await g.invoke(new Command({ resume: { prd: '# PRD', docs: [{ path: a }, { path: b }] } }), cfg);
+
+    expect(fs.readFileSync(path.join(docsDir, 'refs', 'note.md'), 'utf-8')).toContain('# 甲');
+    expect(fs.readFileSync(path.join(docsDir, 'refs', 'note-2.md'), 'utf-8')).toContain('# 乙');
+  });
+
   it('沒有 Figma URL 時直接問確認', async () => {
     const { g, cfg } = prdGraph();
     await g.invoke({ requirementName: 'demo' }, cfg);
     await g.invoke(new Command({ resume: { prdMarkdown: '# PRD' } }), cfg);
 
-    expect(await pending(g, cfg)).toEqual({ audience: 'user', type: 'confirm_prd' });
+    const gate = await pending(g, cfg);
+    expect(gate.audience).toBe('user');
+    expect(gate.type).toBe('confirm_prd');
+    // 確認閘門要說出圖到底收了什麼
+    expect(gate.collected.prd.bytes).toBeGreaterThan(0);
+    expect(gate.collected.design.kind).toBe('none');
   });
 
   it('有 Figma URL 時必須發 figma_fetch 工作單，outputs 是 P0 檔案', async () => {
@@ -157,7 +257,9 @@ describe('PRD 節點', () => {
     // TBC 的 id 必須帶著階段名：兩個階段的 TBC 才不會互相蓋掉
     expect(tbcs[0].id).toBe('TBC-FIGMA-prd');
     // 失敗不得把流程卡住：下一個中斷是確認。
-    expect(await pending(g, cfg)).toEqual({ audience: 'user', type: 'confirm_prd' });
+    const gate = await pending(g, cfg);
+    expect(gate.audience).toBe('user');
+    expect(gate.type).toBe('confirm_prd');
   });
 
   it('確認後前進到 spec 階段', async () => {
@@ -203,7 +305,9 @@ describe('PRD 節點', () => {
     expect(tbcs.every((tbc) => tbc.blocking === false)).toBe(true);
     expect(tbcs[0].description).toContain('design-tree.json');
     // 不得堵死流程
-    expect(await pending(g, cfg)).toEqual({ audience: 'user', type: 'confirm_prd' });
+    const gate = await pending(g, cfg);
+    expect(gate.audience).toBe('user');
+    expect(gate.type).toBe('confirm_prd');
   });
 
   it('worker 回 needs_human 時問題要變成使用者的閘門', async () => {
@@ -232,7 +336,7 @@ describe('PRD 節點', () => {
     expect(payload.options).toEqual(['yes', 'no']);
   });
 
-  it('階段 ledger 的 payload 不得放進 artifacts 的 path', async () => {
+  it('artifacts 記的是這一輪產出的檔案，ledger 記的是圖自己的帳', async () => {
     const { g, cfg } = prdGraph();
     await g.invoke({ requirementName: 'demo' }, cfg);
     await g.invoke(
@@ -242,13 +346,17 @@ describe('PRD 節點', () => {
 
     const snap: any = await g.getState(cfg);
     // artifacts 只放產出的檔案：它的 path 一定是路徑
-    expect(snap.values.artifacts).toEqual({});
-    for (const entry of Object.values(snap.values.artifacts ?? {}) as Array<{ path: string }>) {
+    const artifacts = snap.values.artifacts as Record<string, { path: string; hash: string }>;
+    expect(Object.keys(artifacts)).toContain('prd');
+    expect(artifacts.prd.path).toBe(prdPath);
+    for (const entry of Object.values(artifacts)) {
       expect(path.isAbsolute(entry.path)).toBe(true);
     }
     // ledger 有自己的 channel
     expect(Object.keys(snap.values.stageSteps ?? {}).length).toBeGreaterThan(0);
     expect(snap.values.stageSteps['prd/figma-url']).toBe('https://www.figma.com/design/abc');
+    // 設計的決定記在 ledger：spec 階段靠它不再問第二次
+    expect(snap.values.stageSteps['prd/design']).toBe('url');
   });
 
   it('答案形狀不對時要出錯，不得無聲地再問一次', async () => {
@@ -256,8 +364,8 @@ describe('PRD 節點', () => {
     await g.invoke({ requirementName: 'demo' }, cfg);
 
     await expect(
-      g.invoke(new Command({ resume: { prd: '# PRD' } }), cfg)
-    ).rejects.toThrow(/prdMarkdown/);
+      g.invoke(new Command({ resume: { figmaUrl: 'https://www.figma.com/design/abc' } }), cfg)
+    ).rejects.toThrow(/PRD/);
   });
 
   it('approved 不是 true 時不得當成同意', async () => {
@@ -297,11 +405,10 @@ describe('PRD 節點', () => {
     await g.invoke(new Command({ resume: { approved: false } }), cfg);
 
     // 必須回到收集 PRD 的閘門，而不是再問一次確認
-    expect(await pending(g, cfg)).toEqual({
-      audience: 'user',
-      type: 'collect_prd',
-      answer: { prdMarkdown: expect.any(String), figmaUrl: expect.any(String) },
-    });
+    const gate = await pending(g, cfg);
+    expect(gate.audience).toBe('user');
+    expect(gate.type).toBe('collect_prd');
+    expect(gate.answer.prd).toBeTypeOf('string');
 
     await g.invoke(new Command({ resume: { prdMarkdown: '# PRD 第二版' } }), cfg);
     expect(fs.readFileSync(prdPath, 'utf-8')).toContain('第二版');
