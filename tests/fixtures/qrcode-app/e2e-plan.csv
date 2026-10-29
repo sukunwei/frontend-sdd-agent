@@ -1,0 +1,6 @@
+test_id,feature,scenario,steps,expected_result,priority
+E2E-001,Text Input,Empty input shows placeholder (AC-001),"Open /qrcode-app;Observe the QR display area",Placeholder message is visible,high
+E2E-002,Live QR Preview,Typing generates a QR code in real time (AC-002),"Open /qrcode-app;Type hello world;Observe the QR display",A QR code image is rendered without error,high
+E2E-003,Download Button,Download button stays disabled while the input is empty (AC-003),"Open /qrcode-app;Observe the download button",The download button has the disabled attribute,high
+E2E-004,Download Button,Download creates a PNG file named qrcode.png (AC-004),"Open /qrcode-app;Type hello world;Click the download button",A file named qrcode.png is downloaded,medium
+E2E-005,Error State,Text longer than 512 characters shows an error (AC-005),"Open /qrcode-app;Type a text of 513 characters",The error message is shown under the input,medium

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "sdd-graph",
+  "description": "sdd-graph：LangGraph 為核心的 SDD 編排器 —— 圖擁有階段路由，Claude Code 會話負責把工作單做完",
+  "owner": {
+    "name": "fe-project"
+  },
+  "plugins": [
+    {
+      "name": "sdd-graph",
+      "description": "LangGraph-based SDD orchestrator: graph owns stage routing, the Claude Code session works the orders",
+      "source": "./",
+      "category": "development",
+      "author": {
+        "name": "fe-project"
+      }
+    }
+  ]
+}

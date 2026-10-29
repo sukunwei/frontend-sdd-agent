@@ -1,0 +1,27 @@
+{
+  "name": "sdd-graph",
+  "version": "0.2.0",
+  "description": "LangGraph-based SDD orchestrator: graph owns stage routing, the Claude Code session works the orders",
+  "type": "module",
+  "bin": {
+    "sdd-graph": "./bin/sdd-graph"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@langchain/langgraph": "1.5.3",
+    "@langchain/langgraph-checkpoint-sqlite": "1.1.0",
+    "tsx": "^4.0.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "5.0.5"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "sdd-graph",
+  "version": "0.2.0",
+  "description": "LangGraph-based SDD orchestrator: graph owns stage routing, the Claude Code session works the orders",
+  "author": {
+    "name": "fe-project"
+  }
+}
