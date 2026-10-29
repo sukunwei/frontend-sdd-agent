@@ -206,6 +206,68 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 | `tdd` | 工作單 × N（開發者 → 規格審查 → 品質審查） | 程式碼、測試、評審 JSON | 失敗兩次 rollback、第三次問使用者 |
 | `verification` | 確定性（圖內） | 四道關卡的結果 | `lint:ts` → `lint` → `test` → `e2e`，失敗要使用者決定 |
 
+### 流程圖
+
+> 下面的圖是 [mermaid](https://mermaid.js.org/) —— GitHub 會直接渲染。用純文字看
+> README 的話，表格與程式碼區塊說的是同一件事。
+
+```mermaid
+flowchart TD
+  START(["start"]) --> BOOT
+
+  BOOT["<b>bootstrap</b> · 確定性<br/>工作區・全域分支鎖・clone 專案"]
+  BOOT --> PRD
+
+  PRD["<b>prd</b> · 先問人<br/>需求由使用者給，不是模型編的"]
+  PRD --> PRD_Q{{"<b>collect_prd</b><br/>把 PRD 問使用者"}}
+  PRD_Q --> PRD_C{{"<b>confirm_prd</b><br/>使用者確認 PRD"}}
+  PRD_C -.->|"不確認"| PRD_Q
+  PRD_C --> SPEC
+
+  SPEC["<b>spec</b> · 工作單<br/>spec_writer → discovery.md + spec.md"]
+  SPEC --> SPEC_Q{{"<b>spec_questions</b> / <b>tbc_blocking</b><br/>澄清・待確認項"}}
+  SPEC_Q -.->|"還有未解的"| SPEC
+  SPEC_Q --> SPEC_C{{"<b>confirm_spec</b><br/>使用者確認規格"}}
+  SPEC_C -.->|"退回"| SPEC
+  SPEC_C --> E2E
+
+  E2E["<b>e2ePlan</b> · 工作單<br/>e2e_planner → e2e-plan.csv"]
+  E2E --> E2E_C{{"<b>confirm_e2e</b>"}}
+  E2E_C -.->|"退回"| E2E
+  E2E_C --> TS
+
+  TS["<b>taskSplit</b> · 工作單<br/>task_splitter → tasks.md<br/>不得有 L 複雜度・id 不得重複"]
+  TS --> TS_C{{"<b>confirm_tasks</b>"}}
+  TS_C -.->|"退回"| TS
+  TS_C --> TDD
+
+  TDD["<b>tdd</b> · 工作單 × N<br/>developer → spec_reviewer → quality_reviewer"]
+  TDD --> VER
+
+  VER["<b>verification</b> · 確定性<br/>lint:ts → lint → test → e2e"]
+  VER --> VER_Q{{"<b>verify_failed</b><br/>使用者決定怎麼辦"}}
+  VER_Q -.->|"manual：回去修"| TDD
+  VER_Q -.->|"skip / abort"| DONE
+  VER --> DONE(["<b>completed</b>"])
+
+  classDef gate fill:#fff4e5,stroke:#e8a33d,stroke-width:2px
+  classDef work fill:#e8f0fe,stroke:#4a7de8,stroke-width:2px
+  classDef det fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
+  classDef term fill:#f3e8fd,stroke:#8e5bd0,stroke-width:2px
+
+  class PRD,PRD_Q,PRD_C,SPEC_Q,SPEC_C,E2E_C,TS_C,VER_Q gate
+  class SPEC,E2E,TS,TDD work
+  class BOOT,VER det
+  class START,DONE term
+```
+
+| 顏色 | 意思 |
+|---|---|
+| 橘 | 使用者閘口 —— 要人決定 |
+| 藍 | 工作單 —— 會話用本會話的工具做 |
+| 綠 | 圖內確定性 —— 圖自己算完 |
+| 紫 | 起訖 |
+
 `prd` 階段是**先問人**的：需求是使用者給的，不是模型編的。
 每一段的需求文件都寫在 repo 裡（`docs/<requirement>/`），跟程式碼一起被 commit。
 
@@ -213,6 +275,48 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 `spec_reviewer`（有沒有做到驗收條件）→ `quality_reviewer`（品質過不過關）。
 評審不通過就回到 developer。連續失敗會 `rollback`（回到這個 task 起的 git 標籤），
 第三次才會問使用者。
+
+### TDD 的一輪
+
+```mermaid
+flowchart TD
+  DEV["<b>developer</b> 工作單<br/>寫實作 + 測試<br/>outputs 必須真的在磁碟上"]
+  DEV --> REV1
+
+  REV1{"<b>spec_reviewer</b><br/>有沒有做到驗收條件？"}
+  REV1 -->|pass| REV2
+  REV1 -->|fail| LAD
+
+  REV2{"<b>quality_reviewer</b><br/>品質過不過關？"}
+  REV2 -->|pass| NEXT(["下一個 task"])
+  REV2 -->|fail| LAD
+
+  LAD["<b>升級階梯</b><br/>計數住在圖的 state 裡<br/>觸發：評審 fail・單沒交付・結果不是合法 JSON"]
+  LAD --> A1{"第 1 次失敗"}
+  A1 -->|"再給一次機會"| DEV
+  A1 -->|"再失敗"| A2{"第 2 次失敗"}
+  A2 -->|"再失敗"| A3{"第 3 次失敗"}
+
+  A2 --> RB["<b>rollback</b><br/>git reset 回這個 task 起的標籤"]
+  RB --> RBQ{{"<b>tdd_rollback</b><br/>使用者決定：wait / skip / abort"}}
+
+  A3 --> BLQ{{"<b>tdd_blocked</b><br/>使用者決定：wait / skip / abort"}}
+
+  RBQ -.->|"wait：再跑一次"| DEV
+  RBQ -.->|"skip / abort：收掉這個 task"| DONE(["<b>completed</b>"])
+  BLQ -.->|"wait：再跑一次"| DEV
+  BLQ -.->|"skip：放棄這個 task"| DONE
+
+  classDef gate fill:#fff4e5,stroke:#e8a33d,stroke-width:2px
+  classDef work fill:#e8f0fe,stroke:#4a7de8,stroke-width:2px
+  classDef det fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
+  classDef term fill:#f3e8fd,stroke:#8e5bd0,stroke-width:2px
+
+  class REV1,REV2,A1,A2,A3,RBQ,BLQ gate
+  class DEV work
+  class RB det
+  class LAD,NEXT,DONE term
+```
 
 ---
 
@@ -264,6 +368,42 @@ sdd-graph change   --task <n>
 | `2` | 有待處理的中斷 | `{"kind":"interrupt","audience":...,"type":...,"threadId":...,"stage":...,"payload":...}` | - |
 | `1` | 參數錯、沒有這個 thread、違反 audience 合約 | - | `{"kind":"error","code":...,"message":...}` |
 
+宿主（Claude Code 會話）拿到退出碼之後做的事：
+
+```mermaid
+flowchart TD
+  LOOP["sdd-graph start / resume"] --> RC{"退出碼"}
+
+  RC -->|"0"| FIN(["回報：這一輪完成"])
+  RC -->|"1"| ERR(["讀 stderr<br/>kind: error ・ code: ..."])
+
+  RC -->|"2 有待處理的中斷"| ENV["讀 stdout 的 JSON 信封<br/>kind: interrupt ・ audience ・ type ・ payload"]
+
+  ENV --> AUD{"audience"}
+
+  AUD -->|"user"| ASK["把 payload 的 question / options<br/>問使用者"]
+  ASK --> AP["sdd-graph approve --payload '...'"]
+
+  AUD -->|"host"| WORK["照 payload.role 與 payload.prompt<br/>用本會話的工具完成 payload.outputs"]
+  WORK --> CP["sdd-graph complete --result '...'"]
+
+  AP --> LOOP
+  CP --> LOOP
+
+  MIS["<b>走錯會被擋下來</b><br/>approve 答 host 的單 → audience_mismatch<br/>complete 答 user 的閘口 → audience_mismatch"]
+  AP -.-> MIS
+  CP -.-> MIS
+
+  classDef ok fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
+  classDef gate fill:#fff4e5,stroke:#e8a33d,stroke-width:2px
+  classDef work fill:#e8f0fe,stroke:#4a7de8,stroke-width:2px
+  classDef bad fill:#fde8e8,stroke:#d04a4a,stroke-width:2px
+
+  class RC,AUD gate
+  class ENV,ASK work
+  class LOOP,FIN,ERR,AP,CP ok
+  class MIS bad
+```
 stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audience_mismatch`、
 `invalid_result`、`invalid_payload`、`invalid_order`、`already_completed`、
 `lock_not_owned`、`not_implemented`、`internal_error`。
