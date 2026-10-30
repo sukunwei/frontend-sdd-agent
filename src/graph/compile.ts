@@ -2,6 +2,7 @@ import { Command, END, START, StateGraph } from '@langchain/langgraph';
 import type { CompiledGraph } from '@langchain/langgraph';
 import type { SqliteSaver } from '@langchain/langgraph-checkpoint-sqlite';
 import { bootstrapNode } from '../nodes/bootstrap.js';
+import type { FigmaOptions } from '../nodes/figma-flow.js';
 import { e2eNode } from '../nodes/e2e-plan.js';
 import { prdNode } from '../nodes/prd.js';
 import { specNode } from '../nodes/spec.js';
@@ -124,6 +125,13 @@ export interface BuildGraphOptions {
    * `tsc`, `eslint`, `jest` or `playwright` for real.
    */
   verifyOptions?: VerifyOptions;
+  /**
+   * How the Figma stage measures the HTML prototype.
+   *
+   * The tests inject a fake measurer this way, so that a unit test never
+   * starts a browser.
+   */
+  figmaOptions?: FigmaOptions;
 }
 
 /**
@@ -214,11 +222,11 @@ export function buildGraph(opts: BuildGraphOptions): CompiledSddGraph {
 
   // The real PRD node: it asks the user for the requirements, maybe hands
   // out a Figma work order and asks for a confirmation.
-  const prdFn: NodeFn = (state) => prdNode(state);
+  const prdFn: NodeFn = (state) => prdNode(state, opts.figmaOptions);
 
   // The real spec node: a host work order writes the spec, the node keeps
   // the gate (acceptance criteria, questions, blocking TBCs).
-  const specFn: NodeFn = (state) => specNode(state);
+  const specFn: NodeFn = (state) => specNode(state, opts.figmaOptions);
 
   // The real e2e node: a host work order writes the plan, the node checks
   // that the plan has test cases.

@@ -158,7 +158,7 @@ claude plugin list | grep -A 4 sdd-graph
    [`collect_prd`：一次問完三件事](#collect_prd一次問完三件事)。
 3. 你回答 → 圖進 `spec` → 發一張 `spec_writer` 工作單給會話 → 會話寫出
    `discovery.md` + `spec.md`（含驗收條件 `AC-001`…）→ 圖解析、追問、確認。
-4. `e2ePlan` → `taskSplit` → `tdd`（每個 task 一輪：實作 → 規格審查 → 品質審查）
+4. `e2ePlan` → `taskSplit` → `tdd`（每個 task 一輪：實作 → 審查）
    → `verification`（四道關卡）→ `completed`。
 5. 每一段要你確認的閘口（`confirm_prd` / `confirm_spec` / `confirm_e2e` / `confirm_tasks`）
    都會問你。
@@ -203,12 +203,12 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 | 階段 | 誰執行 | 產出 | 閘口 |
 |---|---|---|---|
 | `bootstrap` | 確定性（圖內） | workspace、分支鎖、clone、run-metadata | 鎖衝突／舊 run 要 resume 還是 reset |
-| `prd` | **先問人** | `prd.md`、`design.md`、`refs/*` | `collect_prd` →（有 Figma URL 才）`figma_fetch` → `confirm_prd` |
+| `prd` | **先問人** | `prd.md`、`design.md`、`refs/*`、`figma/*`（含 HTML 原型） | `collect_prd` →（有 Figma URL 才）`figma_fetch` → `figma_prototype` → 量測 →（必要時）`figma_polish` → `confirm_prd` |
 | `spec` | 工作單 | `discovery.md` + `spec.md` | 澄清最多 3 輪、blocking TBC 未解不得離開、`confirm_spec` |
 | `e2ePlan` | 工作單 | `e2e-plan.csv` | `confirm_e2e` |
-| `taskSplit` | 工作單 | `tasks.md` | 不得有 `L`、id 不得重複、id 要由標題派生、`confirm_tasks` |
-| `tdd` | 工作單 × N（開發者 → 規格審查 → 品質審查） | 程式碼、測試、評審 JSON | 失敗兩次 rollback、第三次問使用者 |
-| `verification` | 確定性（圖內） | 四道關卡的結果 | `lint:ts` → `lint` → `test` → `e2e`，失敗要使用者決定 |
+| `taskSplit` | 工作單 | `tasks.md` | `L` 要看起來像一個行為（≥3 條驗收條件）、id 不得重複、id 要由標題派生、`confirm_tasks` |
+| `tdd` | 工作單 × N（開發者 → 審查） | 程式碼、測試、評審 JSON | 失敗兩次 rollback、第三次問使用者 |
+| `verification` | 確定性（圖內） | 四道關卡的結果 | `lint:ts` → `lint` →（`test` ∥ `e2e`），失敗要使用者決定 |
 
 ### 流程圖
 
@@ -224,7 +224,13 @@ flowchart TD
 
   PRD["<b>prd</b> · 先問人<br/>需求由使用者給，不是模型編的"]
   PRD --> PRD_Q{{"<b>collect_prd</b><br/>把 PRD 問使用者"}}
-  PRD_Q --> PRD_C{{"<b>confirm_prd</b><br/>使用者確認 PRD"}}
+  PRD_Q --> PRD_F["<b>figma_fetch</b> 工作單<br/>抓 P0 資源 + 每個 frame 一張截圖"]
+  PRD_F --> PRD_P["<b>figma_prototype</b> 工作單<br/>用 figma-implement-design skill 做 HTML 原型"]
+  PRD_P --> PRD_D["<b>UI diff</b> · 確定性<br/>渲染原型 vs Figma 截圖"]
+  PRD_D --> PRD_R{"有硬失敗？"}
+  PRD_R -->|"有"| PRD_X["<b>figma_polish</b> 工作單<br/>修到量得進去"]
+  PRD_X --> PRD_D
+  PRD_R -.->|"沒有"| PRD_C{{"<b>confirm_prd</b><br/>使用者確認 PRD"}}
   PRD_C -.->|"不確認"| PRD_Q
   PRD_C --> SPEC
 
@@ -240,15 +246,15 @@ flowchart TD
   E2E_C -.->|"退回"| E2E
   E2E_C --> TS
 
-  TS["<b>taskSplit</b> · 工作單<br/>task_splitter → tasks.md<br/>不得有 L 複雜度・id 不得重複"]
+  TS["<b>taskSplit</b> · 工作單<br/>task_splitter → tasks.md<br/>L 要像一個行為・id 不得重複"]
   TS --> TS_C{{"<b>confirm_tasks</b>"}}
   TS_C -.->|"退回"| TS
   TS_C --> TDD
 
-  TDD["<b>tdd</b> · 工作單 × N<br/>developer → spec_reviewer → quality_reviewer"]
+  TDD["<b>tdd</b> · 工作單 × N<br/>developer → reviewer（spec ＋ quality）"]
   TDD --> VER
 
-  VER["<b>verification</b> · 確定性<br/>lint:ts → lint → test → e2e"]
+  VER["<b>verification</b> · 確定性<br/>lint:ts → lint →（test ∥ e2e）"]
   VER --> VER_Q{{"<b>verify_failed</b><br/>使用者決定怎麼辦"}}
   VER_Q -.->|"manual：回去修"| TDD
   VER_Q -.->|"skip / abort"| DONE
@@ -259,9 +265,9 @@ flowchart TD
   classDef det fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
   classDef term fill:#f3e8fd,stroke:#8e5bd0,stroke-width:2px
 
-  class PRD,PRD_Q,PRD_C,SPEC_Q,SPEC_C,E2E_C,TS_C,VER_Q gate
-  class SPEC,E2E,TS,TDD work
-  class BOOT,VER det
+  class PRD,PRD_Q,PRD_C,PRD_R,SPEC_Q,SPEC_C,E2E_C,TS_C,VER_Q gate
+  class PRD_F,PRD_P,PRD_X,SPEC,E2E,TS,TDD work
+  class BOOT,PRD_D,VER det
   class START,DONE term
 ```
 
@@ -275,10 +281,18 @@ flowchart TD
 `prd` 階段是**先問人**的：需求是使用者給的，不是模型編的。
 每一段的需求文件都寫在 repo 裡（`docs/<requirement>/`），跟程式碼一起被 commit。
 
-**TDD 迴圈**是三張單一輪：會話拿到 `developer` 工作單（要寫實作**和**測試）→
-`spec_reviewer`（有沒有做到驗收條件）→ `quality_reviewer`（品質過不過關）。
+**給了 Figma 連結時，PRD 階段會多做兩件事**：把抓到的資源做成一頁靜態 HTML 原型，
+再拿原型渲染出來的畫面跟 Figma 截圖做像素比對。原型做得出來，代表抓到的資源夠用；
+做不出來，代表抓漏了 —— 這時候**還沒寫任何產品程式碼**，修的成本只有改一份 HTML。
+比對的證據留在 `docs/<requirement>/figma/diff/report.md`。
+
+**TDD 迴圈**是兩張單一輪：會話拿到 `developer` 工作單（要寫實作**和**測試）→
+`reviewer`（一次回答兩個問題：有沒有做到驗收條件？寫得好而且是對的嗎？）。
 評審不通過就回到 developer。連續失敗會 `rollback`（回到這個 task 起的 git 標籤），
 第三次才會問使用者。
+
+> **以前是三張單**：規格審查與品質審查各一張。兩張單讀的是同一批檔案、同一份 diff，
+> 第二次來回買到的東西很少 —— 每個 task 因此少付一次來回。
 
 ### TDD 的一輪
 
@@ -287,13 +301,9 @@ flowchart TD
   DEV["<b>developer</b> 工作單<br/>寫實作 + 測試<br/>outputs 必須真的在磁碟上"]
   DEV --> REV1
 
-  REV1{"<b>spec_reviewer</b><br/>有沒有做到驗收條件？"}
-  REV1 -->|pass| REV2
-  REV1 -->|fail| LAD
-
-  REV2{"<b>quality_reviewer</b><br/>品質過不過關？"}
-  REV2 -->|pass| NEXT(["下一個 task"])
-  REV2 -->|fail| LAD
+  REV1{"<b>reviewer</b><br/>有沒有做到驗收條件？<br/>寫得好而且是對的嗎？"}
+  REV1 -->|兩個都 pass| NEXT(["下一個 task"])
+  REV1 -->|任一 fail| LAD
 
   LAD["<b>升級階梯</b><br/>計數住在圖的 state 裡<br/>觸發：評審 fail・單沒交付・結果不是合法 JSON"]
   LAD --> A1{"第 1 次失敗"}
@@ -400,6 +410,7 @@ sdd-graph approve  --task <n> --payload <json|@file>
 sdd-graph status   --task <n>
 sdd-graph stop     --task <n> [--force]
 sdd-graph change   --task <n>
+sdd-graph figma-diff --docs <dir> [--repo <dir>]
 ```
 
 **退出碼就是合約**，stdout 的 JSON 只說「發生了什麼」：
@@ -450,6 +461,28 @@ stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audie
 `invalid_result`、`invalid_payload`、`invalid_order`、`already_completed`、
 `lock_not_owned`、`not_implemented`、`internal_error`。
 
+### `sdd-graph figma-diff`：量原型跟 Figma 截圖的差異
+
+這個命令**不碰圖**，它量的是 HTML 原型跟 Figma 截圖差多少。工人（會話）跟圖
+呼叫的是**同一支程式**：工人在自己的回合裡改到滿意，圖最後再跑一次當權威證據。
+
+```bash
+sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
+```
+
+| exit | 意思 |
+|---|---|
+| `0` | 量完了，沒有硬失敗（**像素有一點差是正常的**，那是軟指標） |
+| `1` | 量完了，但有硬失敗：某個 frame 缺頁子、頁子渲染不出來、或截圖與渲染的尺寸對不上 |
+| `2` | 命令跑不起來（例如 `--docs` 不存在） |
+
+報告寫在 `<需求目錄>/figma/diff/`：`report.md`（人看）、`frames.json`（機器看）、
+每個 frame 的差異圖，以及 HTML 實際渲染出來的 `render/<frameKey>.png`。
+
+**瀏覽器是目標專案的**：這支命令跑 `npx playwright screenshot`，用的是目標專案
+自己的 Playwright（驗證階段的 e2e 關卡本來就靠它）。目標專案沒有 Playwright 的話，
+硬失敗的訊息會說得出來。
+
 **工作單的輸出必須真的在磁碟上**：`complete` 會檢查工作單 `outputs` 裡的每個路徑。
 沒寫出來 → **同一張單再發一次**，而且不計任何失敗次數（那不是品質問題，
 是工人根本沒做完）。
@@ -474,6 +507,8 @@ stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audie
 | `figma_missing` | user | 給了 Figma 連結但抓不到檔案 | `{ action: 'fetch' \| 'tbc' \| 'skip' }` |
 | `figma_needs_human` | user | Figma 那一班的工人卡住了，要使用者決定 | `{ question, options }` |
 | `work_order`（role=`figma_fetch`） | host | 使用者給了 Figma URL | `WorkerResult` |
+| `work_order`（role=`figma_prototype`） | host | Figma 資源抓到了，做 HTML 原型 | `WorkerResult` |
+| `work_order`（role=`figma_polish`） | host | 原型量不進去，修它 | `WorkerResult` |
 | `work_order`（role=spec_writer 等） | host | 寫作／實作／評審 | `WorkerResult` |
 | `worker_needs_human` | user | 工人卡住，要使用者決定（spec／e2e／task split） | `{ question, options }` |
 | `confirm_prd` / `confirm_spec` / `confirm_e2e` / `confirm_tasks` | user | 階段出口 | `{ approved, comment? }` |
@@ -493,8 +528,8 @@ stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audie
 | `previousAnswer` | 使用者的答案圖看不懂時 | 上一次那個看不懂的答案（原文）。圖會把閘門再問一次，帶著這個診斷。 |
 | `note` | 同上 | 為什麼要再問一次。 |
 
-工作單的 role：`figma_fetch`、`spec_writer`、`e2e_planner`、`task_splitter`、
-`developer`、`spec_reviewer`、`quality_reviewer`。
+工作單的 role：`figma_fetch`、`figma_prototype`、`figma_polish`、`spec_writer`、
+`e2e_planner`、`task_splitter`、`developer`、`reviewer`。
 工作單的正文在 `prompts/<role>.md`（模板），由 `src/prompts/loader.ts` 填入
 目標、工作目錄、必讀輸入、必交輸出與產出格式。
 
@@ -516,7 +551,15 @@ stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audie
 │   │   │   ├── tasks.md
 │   │   │   ├── workflow-state.json  ← 給人看的狀態鏡像（圖獨家覆寫）
 │   │   │   ├── verify/*.log        ← 四道關卡的日誌
-│   │   │   └── figma/*             ← Figma P0 資源
+│   │   │   └── figma/              ← Figma 資源
+│   │   │       ├── *.json / *.md   ← P0 資源（節點樹、token、設計說明）
+│   │   │       ├── screenshots/    ← 每個 frame 一張 png
+│   │   │       ├── prototype/      ← 靜態 HTML 原型（視覺真值來源）
+│   │   │       │   ├── index.html
+│   │   │       │   ├── <frameKey>.html
+│   │   │       │   ├── css/tokens.css
+│   │   │       │   └── assets/
+│   │   │       └── diff/           ← 原型跟截圖的 UI diff（report.md・frames.json）
 │   │   └── <你的程式碼與測試>
 │   └── run-metadata.json          ← runId、branch、repoUrl
 └── runtime/

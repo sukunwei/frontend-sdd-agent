@@ -120,7 +120,7 @@ describe('TDD 失敗升級（圖側）', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'page.tsx'), 'export default function Page() { return null; }\n', 'utf-8');
     writeFileSync(join(dir, 'page.module.css'), '.page {}\n', 'utf-8');
-    const test = join(target, 'src', '__tests__', 'setup-qrcode-page-route.test.tsx');
+    const test = join(target, 'src', '__tests__', 'setup-qrcode-page-route.test.ts');
     mkdirSync(join(test, '..'), { recursive: true });
     writeFileSync(test, "it('renders', () => {});\n", 'utf-8');
     if (existsSync(join(target, '.git'))) {
@@ -136,7 +136,13 @@ describe('TDD 失敗升級（圖側）', () => {
     );
   }
 
-  /** The spec reviewer rejects the work. */
+  /**
+   * The reviewer rejects the work.
+   *
+   * The reviewer answers two questions in one order: the spec verdict fails
+   * (the task was not done), the quality verdict passes (what was written is
+   * not the problem).
+   */
   async function specFails(g: any, cfg: any): Promise<void> {
     await g.invoke(
       new Command({
@@ -144,11 +150,16 @@ describe('TDD 失敗升級（圖側）', () => {
           status: 'ok',
           summary: '',
           changedFiles: [],
-          review: {
-            role: 'spec',
-            verdict: 'fail',
-            issues: [{ file: 'src/app/page/qrcode-app/page.tsx', message: '沒有實作' , severity: 'critical' }],
-          },
+          reviews: [
+            {
+              role: 'spec',
+              verdict: 'fail',
+              issues: [
+                { file: 'src/app/page/qrcode-app/page.tsx', message: '沒有實作', severity: 'critical' },
+              ],
+            },
+            { role: 'quality', verdict: 'pass', issues: [] },
+          ],
         },
       }),
       cfg
@@ -170,6 +181,46 @@ describe('TDD 失敗升級（圖側）', () => {
 
     const state = await values(g, cfg);
     expect(state.tddAttempts).toBe(1);
+  });
+
+  it('兩份結論都要回到 developer 工作單裡（spec 的不會被 quality 蓋掉）', async () => {
+    const { g, cfg } = tddGraph();
+    await g.invoke({ requirementName: 'demo' }, cfg);
+    developerWorks();
+    await developerDone(g, cfg);
+
+    // 兩個問題都有結論，而且都不通過
+    await g.invoke(
+      new Command({
+        resume: {
+          status: 'ok',
+          summary: '',
+          changedFiles: [],
+          reviews: [
+            {
+              role: 'spec',
+              verdict: 'fail',
+              issues: [
+                { file: 'src/app/page/qrcode-app/page.tsx', message: '驗收條件沒做到', severity: 'critical' },
+              ],
+            },
+            {
+              role: 'quality',
+              verdict: 'fail',
+              issues: [
+                { file: 'src/app/page/qrcode-app/page.tsx', message: '壞掉的 pattern', severity: 'high' },
+              ],
+            },
+          ],
+        },
+      }),
+      cfg
+    );
+
+    const payload = await pending(g, cfg);
+    expect(payload.role).toBe('developer');
+    expect(payload.prompt).toContain('驗收條件沒做到');
+    expect(payload.prompt).toContain('壞掉的 pattern');
   });
 
   it('第二次失敗要 rollback 並問使用者', async () => {
@@ -338,7 +389,7 @@ describe('TDD 失敗升級（圖側）', () => {
       cfg
     );
     let payload = await pending(g, cfg);
-    expect(payload.role).toBe('spec_reviewer');
+    expect(payload.role).toBe('reviewer');
     expect((await values(g, cfg)).tddAttempts).toBe(0);
 
     // 第二次：還是非法 JSON —— 升級
@@ -363,7 +414,7 @@ describe('TDD 失敗升級（圖側）', () => {
       cfg
     );
     let payload = await pending(g, cfg);
-    expect(payload.role).toBe('spec_reviewer');
+    expect(payload.role).toBe('reviewer');
     expect((await values(g, cfg)).tddAttempts).toBe(0);
 
     // 第二次：還是沒做完 —— 升級，不能再無限發下去

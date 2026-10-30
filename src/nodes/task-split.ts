@@ -75,17 +75,21 @@ const STEP_ANSWERED = 'worker-answered';
 /**
  * What the task split stage found in the documents.
  *
- * `tasks` holds the tasks that may enter the state - a task of complexity
- * `L` is **not** among them: the state only knows `S` and `M`, and `L` is
- * reported through `hasComplexL`.
+ * `tasks` holds the tasks that may enter the state.
  */
 export interface TaskSplitExit {
   /** The plan may be worked. */
   ok: boolean;
-  /** The tasks of the plan, without the ones of complexity `L`. */
+  /** The tasks of the plan. */
   tasks: Task[];
-  /** The plan has a task of complexity `L`. */
-  hasComplexL: boolean;
+  /**
+   * The `L` tasks that do not look like a single behaviour.
+   *
+   * The graph cannot tell whether a task is one behaviour, but it can tell
+   * whether it has more than one observable acceptance criterion: an `L`
+   * with one or two criteria is an `M` that has not been split yet.
+   */
+  invalidComplexTasks: string[];
   /** The task ids that appear more than once. */
   duplicateIds: string[];
   /** The acceptance criteria no task covers. */
@@ -164,7 +168,7 @@ export function taskSplitExit(_state: GraphState, docsDir: string): TaskSplitExi
   const empty: TaskSplitExit = {
     ok: false,
     tasks: [],
-    hasComplexL: false,
+    invalidComplexTasks: [],
     duplicateIds: [],
     orphanAcs: [],
     orphanTasks: [],
@@ -184,14 +188,21 @@ export function taskSplitExit(_state: GraphState, docsDir: string): TaskSplitExi
   }
 
   const matrix = buildTraceabilityMatrix(acIds, parsed, readE2eRows(docsDir));
-  const hasComplexL = parsed.some((task) => task.complexity === 'L');
+  const invalidComplexTasks = parsed
+    .filter((task) => task.complexity === 'L' && task.acceptanceCriteria.length < 3)
+    .map((task) => task.id);
 
   return {
     // An empty plan must never pass the gate. The parser throws for an
     // empty document today, but the gate may not depend on that.
-    ok: parsed.length > 0 && !hasComplexL && duplicateIdsOf(parsed).length === 0,
-    tasks: parsed.filter(isWorkable).map(toStateTask),
-    hasComplexL,
+    ok:
+      parsed.length > 0 &&
+      invalidComplexTasks.length === 0 &&
+      duplicateIdsOf(parsed).length === 0,
+    tasks: parsed
+      .filter((task) => !invalidComplexTasks.includes(task.id))
+      .map(toStateTask),
+    invalidComplexTasks,
     duplicateIds: duplicateIdsOf(parsed),
     orphanAcs: matrix.rows.filter((row) => row.taskIds.length === 0).map((row) => row.acId),
     orphanTasks: matrix.orphanTasks,
@@ -365,12 +376,8 @@ function duplicateIdsOf(tasks: ParsedTask[]): string[] {
 }
 
 /** May this task enter the state? (the state knows `S` and `M` only) */
-function isWorkable(task: ParsedTask): task is ParsedTask & { complexity: Complexity } {
-  return task.complexity !== 'L';
-}
-
 /** The state shape of a task. */
-function toStateTask(task: ParsedTask & { complexity: Complexity }): Task {
+function toStateTask(task: ParsedTask): Task {
   return {
     id: task.id,
     title: task.title,
@@ -389,7 +396,7 @@ function splitFailedTbc(result: unknown): TBCItem {
 
 /** Why the plan was refused. */
 function reasonFor(exit: TaskSplitExit): string {
-  if (exit.hasComplexL) return 'complexity_L';
+  if (exit.invalidComplexTasks.length > 0) return 'complexity_L';
   if (exit.duplicateIds.length > 0) return 'duplicate_ids';
   return 'invalid_tasks';
 }
@@ -397,9 +404,12 @@ function reasonFor(exit: TaskSplitExit): string {
 /** What the worker has to fix in the re-issue. */
 function noteFor(exit: TaskSplitExit): string {
   const notes: string[] = [];
-  if (exit.hasComplexL) {
+  if (exit.invalidComplexTasks.length > 0) {
     notes.push(
-      'A task of complexity `L` is too big: split it into tasks of complexity S or M (S/M only).'
+      `The task(s) ${exit.invalidComplexTasks.join(', ')} are marked \`L\` but do not look ` +
+        'like a single behaviour: an `L` task is ONE behaviour that spans several files, ' +
+        'and it needs at least 3 acceptance criteria. An `L` task with 1-2 criteria is an ' +
+        '`M` that has not been split yet.'
     );
   }
   if (exit.duplicateIds.length > 0) {

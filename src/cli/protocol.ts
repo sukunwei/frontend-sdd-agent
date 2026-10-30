@@ -28,9 +28,10 @@ export const WORK_ORDER_ROLES = [
   'e2e_planner',
   'task_splitter',
   'developer',
-  'spec_reviewer',
-  'quality_reviewer',
+  'reviewer',
   'figma_fetch',
+  'figma_prototype',
+  'figma_polish',
 ] as const;
 
 /** Role of a host work order. */
@@ -91,6 +92,13 @@ export const WorkerResultSchema = z.object({
   summary: z.string(),
   changedFiles: z.array(z.string()),
   review: ReviewResultSchema.optional(),
+  /**
+   * The reviews of a combined review.
+   *
+   * The reviewer answers with one result per role (`spec` and `quality`);
+   * a single review keeps working for a worker that only does one of them.
+   */
+  reviews: z.array(ReviewResultSchema).optional(),
   interrupt: z
     .object({
       type: z.string(),
@@ -196,11 +204,7 @@ export function rejectionMarker(reason: RejectionReason): RejectionMarker {
  * the marker would read it as a worker result that is not there, and the
  * order would be lost instead of re-issued.
  */
-export const REJECTION_AWARE_ROLES = [
-  'developer',
-  'spec_reviewer',
-  'quality_reviewer',
-] as const;
+export const REJECTION_AWARE_ROLES = ['developer', 'reviewer'] as const;
 
 /**
  * Does the node that owns this order know the rejection marker?

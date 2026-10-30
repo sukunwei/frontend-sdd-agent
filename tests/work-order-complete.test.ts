@@ -24,25 +24,28 @@ describe('complete 驗證', () => {
 
   it('outputs 都在且評審通過時才算成功', () => {
     const r = validateCompletion(
-      { outputs: [], resultSchema: 'review', role: 'spec_reviewer' } as any,
+      { outputs: [], resultSchema: 'review', role: 'reviewer' } as any,
       {
         status: 'ok',
         summary: '',
         changedFiles: [],
-        review: { role: 'spec', verdict: 'pass', issues: [] },
+        reviews: [
+          { role: 'spec', verdict: 'pass', issues: [] },
+          { role: 'quality', verdict: 'pass', issues: [] },
+        ],
       } as any
     );
     expect(r.ok).toBe(true);
   });
 
-  it('評審工作單沒有說自己是哪一位審查者 → 非法評審', () => {
+  it('審查只回一份結論 → 非法評審（兩個問題都要回答）', () => {
     const r = validateCompletion(
-      { outputs: [], resultSchema: 'review' } as any,
+      { outputs: [], resultSchema: 'review', role: 'reviewer' } as any,
       {
         status: 'ok',
         summary: '',
         changedFiles: [],
-        review: { role: 'spec', verdict: 'pass', issues: [] },
+        reviews: [{ role: 'spec', verdict: 'pass', issues: [] }],
       } as any
     );
     expect(r.ok).toBe(false);
@@ -51,12 +54,15 @@ describe('complete 驗證', () => {
 
   it('工人說沒做完（status: failed）就算沒完成，帶著合法評審也不行', () => {
     const r = validateCompletion(
-      { outputs: [], resultSchema: 'review', role: 'spec_reviewer' } as any,
+      { outputs: [], resultSchema: 'review', role: 'reviewer' } as any,
       {
         status: 'failed',
         summary: '沒寫完',
         changedFiles: [],
-        review: { role: 'spec', verdict: 'pass', issues: [] },
+        reviews: [
+          { role: 'spec', verdict: 'pass', issues: [] },
+          { role: 'quality', verdict: 'pass', issues: [] },
+        ],
       } as any
     );
     expect(r.ok).toBe(false);
@@ -75,9 +81,9 @@ describe('complete 驗證', () => {
     expect(r.countsAsFailure).toBe(true);
   });
 
-  it('評審角色與工作單不符時視為非法評審', () => {
+  it('審查的結論少了一個角色時視為非法評審', () => {
     const r = validateCompletion(
-      { outputs: [], resultSchema: 'review', role: 'quality_reviewer' } as any,
+      { outputs: [], resultSchema: 'review', role: 'reviewer' } as any,
       {
         status: 'ok',
         summary: '',

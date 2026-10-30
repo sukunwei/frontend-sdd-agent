@@ -29,13 +29,23 @@
 
    | 檔案 | 內容 |
    |------|------|
-   | `figma/figma-meta.json` | 設計檔的 metadata（file key、名稱、最後修改時間、頁面清單） |
+   | `figma/figma-meta.json` | 設計檔的 metadata（file key、名稱、最後修改時間、頁面清單、**主要畫面清單**） |
    | `figma/design-tree.json` | 設計節點樹（frame、component、instance、尺寸、座標） |
    | `figma/design-tokens.json` | 色彩、字級、間距等 design token |
    | `figma/design-context.md` | 給實作者看的設計說明（版面、狀態、互動、邊界） |
 
-3. 另外把**至少一張**畫面截圖存成 png，放進工作單說明的截圖目錄（`outputs` 的最後一項，見下方說明）。
-4. 抓完後把結果交回圖。
+3. 每個**主要畫面**（frame）存一張 png，放進工作單說明的截圖目錄（`outputs` 的最後一項，見下方說明）。
+   **檔名必須是 frameKey**：frame 的 node id 把 `:` 換成 `-`（`1:23` → `1-23`）。後面的原型階段靠這個檔名把截圖跟頁子配對。
+4. `figma/figma-meta.json` 裡要有 `frames` 陣列，每個主要畫面一筆：
+
+   ```json
+   "frames": [
+     { "nodeId": "1:23", "name": "Home / Desktop", "width": 1440, "height": 900 }
+   ]
+   ```
+
+   原型階段要靠它拼出帶 `node-id` 的 Figma 網址，也靠它知道每張截圖該是多大。
+5. 抓完後把結果交回圖。
 
 ## 約束
 - 只改工作單 `outputs` 列出的路徑（P0 檔案與截圖目錄）；`cwd`（repo）裡只可**引用**既有的專案設定（例如既有的忽略清單慣例），不得為了產出它們而改動原始碼。不要動其他檔案。

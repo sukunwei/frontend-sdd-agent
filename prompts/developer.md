@@ -43,7 +43,7 @@
 - **一次只做一個 task**：只實作這張工作單指派的 task。
 - **把工作 commit 起來**：實作完成後，在目前的 branch 上 `git add` + `git commit` 你的改動。這個 task 失敗三次時，圖會用 git 標籤把程式碼 rollback 回 task 的起點 —— 沒有 commit 的改動回不去。
 - **GREEN 階段不 refactor**：GREEN 是「讓它動」，REFACTOR 才是「讓它對」。
-- **UI 真值來源**：UI task 的樣式只能以本地的 Figma P0 素材為準，不准「猜」。
+- **UI 真值來源**：UI task 的樣式只能以本地的 Figma P0 素材為準，不准「猜」。**視覺以 HTML 原型為準、截圖為輔** —— 截圖只能說「長這樣」，HTML 原型能說「這裡是 8px 間距、這是 `var(--color-primary)`、這是三欄 grid」。
 - **不寫 Raw 樣式值**：優先用 design token；不要為了省事引入 spec/token 沒有 justify 的 hex/px。
 
 ### UI 相關 task 要讀的 Figma P0 素材
@@ -53,8 +53,16 @@
 - `docs/<requirement>/figma/design-context.md`
 - `docs/<requirement>/figma/screenshots/*.png`
 - `docs/<requirement>/figma/figma-meta.json`
+- `docs/<requirement>/figma/prototype/index.html` —— **視覺真值**：每一個 frame 一頁 HTML
+- `docs/<requirement>/figma/prototype/<frameKey>.html` —— 這個 task 對應的那一頁
+- `docs/<requirement>/figma/prototype/css/tokens.css` —— design token 已經是 CSS 變數了
+
+**上面這三個原型檔案只有「有 Figma 設計」時才會存在**（這個需求給了 Figma 連結，
+而且抓取成功）。沒有就沒有原型：這時以 design-tree 與 design token 為準。
 
 任何一份必要的 P0 素材缺少，都要明確回報，並在動手寫視覺細節之前先提出 TBC。
+
+**有原型的話，它已經跟 Figma 截圖量過一次了**（見 `docs/<requirement>/figma/diff/report.md`）。你在實作時**不必**再跑一次像素比對 —— 照著原型做出來就對了；你只負責把原型裡的樣式翻成這個專案的寫法。
 
 ---
 
@@ -126,7 +134,7 @@ describe('SearchSelect', () => {
 ## RED Phase
 
 ### Test File
-src/__tests__/TaskName.test.tsx
+src/__tests__/TaskName.test.ts
 
 ### Tests Written (N total)
 - ✕ SearchSelect › 當 query 為空時 › 顯示 placeholder 文字
@@ -134,9 +142,9 @@ src/__tests__/TaskName.test.tsx
 - ✕ SearchSelect › 當遠端請求失敗時 › 顯示錯誤提示
 
 ### Failure Evidence
-$ jest src/__tests__/TaskName.test.tsx --no-coverage
+$ jest src/__tests__/TaskName.test.ts --no-coverage
 
-FAIL src/__tests__/TaskName.test.tsx
+FAIL src/__tests__/TaskName.test.ts
   ✕ should ... (Expected: X, Received: undefined)
 ```
 
@@ -157,9 +165,9 @@ FAIL src/__tests__/TaskName.test.tsx
 // Minimal code — correctness first, cleanliness in REFACTOR
 
 ### Test Results
-$ jest src/__tests__/TaskName.test.tsx --no-coverage
+$ jest src/__tests__/TaskName.test.ts --no-coverage
 
-PASS src/__tests__/TaskName.test.tsx
+PASS src/__tests__/TaskName.test.ts
   ✓ SearchSelect › 當 query 為空時 › 顯示 placeholder 文字
   ✓ SearchSelect › 當 query 為空時 › 不觸發遠端請求
   ✓ SearchSelect › 當遠端請求失敗時 › 顯示錯誤提示
@@ -204,9 +212,9 @@ PASS (all N tests)
 3. Replaced magic number `300` with `DEBOUNCE_MS` constant
 
 ### Post-Refactor Test Results
-$ jest src/__tests__/TaskName.test.tsx --no-coverage
+$ jest src/__tests__/TaskName.test.ts --no-coverage
 
-PASS src/__tests__/TaskName.test.tsx
+PASS src/__tests__/TaskName.test.ts
   ✓ All N tests still passing
 
 ### Before / After (key diffs)
@@ -266,7 +274,7 @@ UI 相關的 task 另外附上：
 
 ### 檔案位置
 
-- 單元/整合測試：`src/__tests__/<FeatureName>.test.tsx`
+- 單元/整合測試：`src/__tests__/<FeatureName>.test.ts`（單元測試用 `.ts` 就夠，**不要為了單元測試開 `.tsx`**）
 - **這個 task 的測試檔**：工作單的「必交輸出」清單裡已經列了這個 task 的測試檔路徑 —— **那個路徑就是你要寫的測試檔**（RED 階段先寫它）
 - 實作：依 task 或 CLAUDE.md 的結構
 

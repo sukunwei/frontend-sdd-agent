@@ -30,7 +30,7 @@
 
 | Task ID | Title | Complexity | Priority | AC Refs |
 |---------|-------|------------|----------|---------|
-| TASK-setup-qrcode-page-route | Setup QR code page route | S | high | AC-001, AC-003 |
+| TASK-setup-qrcode-page-route | Setup QR code page route | S | high | AC-001, AC-003, AC-004 |
 
 ## Task Details
 
@@ -41,8 +41,9 @@
 **Acceptance Criteria**:
 - 路由 `/qrcode-app` 存在且可渲染
 - 頁面出現 "QR Code Generator" 標題
+- 版面置中、上下排列（依 `spec.md` 的設計系統）
 
-**AC Refs**: AC-001, AC-003
+**AC Refs**: AC-001, AC-003, AC-004
 
 **Files**:
 - `src/app/page/qrcode-app/page.tsx`
@@ -51,17 +52,23 @@
 ## 硬性規則（圖會照這幾條擋你）
 
 1. **Task ID 必須是 `TASK-` + 標題派生出的 slug。** 標題 `Setup QR code page route` → `TASK-setup-qrcode-page-route`。規則：標題依非英數字切詞、全部轉小寫、用 `-` 連接；全大寫的縮寫只有在跟後面的字構成既知複合詞時才黏成一個字（`QR code` → `qrcode`，但 `UI tests` → `ui-tests`）。同一個標題永遠得到同一個 slug —— **重新拆一次不應該讓 task 重新編號**。
-2. **複雜度只能是 `S` 或 `M`。** **不得**出現 `L`：一個 `L` 的 task 會被退回重拆。真的很大就拆成兩三個 `S`/`M`。
-3. **每個 task 要有 2～5 條驗收條件**（`Acceptance Criteria` 清單）。
+2. **複雜度只能是 `S`、`M` 或 `L`。** `L` = **一個行為、跨多個檔案、但一個 developer 回合做得完**。`L` 必須有 **3 條以上**的驗收條件 —— 只有 1～2 條的 `L` 是還沒拆開的 `M`，會被退回重寫。
+3. **每個 task 要有 3～8 條驗收條件**（`Acceptance Criteria` 清單）。
 4. **每個 task 至少引用一個 `AC-xxx`**（表格的 `AC Refs` 欄與明細的 `**AC Refs**` 都要寫）。沒有任何 task 可以不引用驗收條件。
 5. **Task ID 不得重複。**
 6. **Priority** 只能是 `high`、`medium` 或 `low`。
+7. **task 數**：整份計畫的 task 數約等於 `ceil(AC 數 / 4)`，最多 **8 個**。超過 8 個不是「需求大」，是拆太細。
 
 ## 拆分原則
 
-- 一個 task 一個可以獨立驗收的行為；不要把「做頁面 + 做元件 + 寫測試」塞成一個 task。
+**為什麼不要太細**：每個 task 要花兩次來回（實作、審查）。多切一刀就是多兩次來回，
+而且每個 task 的審查都要重讀一次 diff 與 spec。**能不合就不要合。**
+
+- **一個 task 一個垂直切片**：一個使用者看得見的行為 + 它的實作 + 它的測試，全部在同一個 task。
+- **測試不要獨立成 task。** 唯一例外是最後一個「端到端驗收」task（要整個 app 才跑得動）。單元測試跟著它測的實作走 —— 那個 task 本來就要用 TDD 流程寫測試。
+- **不要把骨架和內容拆開。** 「先建頁面骨架」再「再填內容」是兩個 task，但中間那個沒有可驗收的使用者行為。
+- **不要把同一次改動拆成三段。** 「加路由」「加元件」「接起來」是同一個行為的三段。
 - 依賴順序由上到下（先路由、再元件、最後接線與測試）。
-- 測試也拆成 task（E2E 一個、單元測試一個），它們要引用對應的 `AC-xxx`。
 
 ## 約束
 - 只改工作單 `outputs` 列出的路徑（`tasks.md`）；`cwd`（repo）裡只可**引用**既有的元件或型別（例如既有的目錄結構），不得為了寫它們而改動原始碼。不要動其他檔案。

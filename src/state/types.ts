@@ -18,27 +18,23 @@ export type Stage =
   | 'completed';
 
 /** Sub-stage inside the TDD loop. */
-export type TddSubStage =
-  | 'pending'
-  | 'developer_done'
-  | 'spec_review_done'
-  | 'quality_review_done'
-  | 'completed';
+export type TddSubStage = 'pending' | 'developer_done' | 'review_done' | 'completed';
 
 /**
- * Complexity of a task AS STORED in the state: only 'S' and 'M'.
+ * Complexity of a task AS STORED in the state.
  *
- * An 'L' task is rejected before it ever reaches the state, so the state
- * never has to represent one.
+ * 'L' is legal: an 'L' task is a **single behaviour** that spans several
+ * files but still fits in one developer turn. The task-split gate rejects
+ * an 'L' that does not look like a single behaviour - see
+ * `invalidComplexTasks`.
  */
-export type Complexity = 'S' | 'M';
+export type Complexity = 'S' | 'M' | 'L';
 
 /**
  * Complexity as it may appear in `tasks.md`.
  *
- * The parser keeps the wider type on purpose: it has to be able to DETECT an
- * 'L' and report it, so that the task-split gate can reject it. Narrowing it
- * here would make that gate blind.
+ * The parser keeps the wide type so that the task-split gate can tell an
+ * 'L' from an 'S' or an 'M'.
  */
 export type ParsedComplexity = 'S' | 'M' | 'L';
 
@@ -141,7 +137,7 @@ export interface SddState {
   tasks: Task[];
   currentTaskIndex: number;
   tddSubStage: TddSubStage;
-  lastReview: ReviewResult | null;
+  lastReviews: ReviewResult[];
   tddAttempts: number;
   verification: { checks: VerificationCheck[] };
   blockers: Blocker[];

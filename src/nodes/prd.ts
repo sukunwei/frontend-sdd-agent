@@ -1,7 +1,6 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import { interrupt } from '@langchain/langgraph';
-import { answerText, isApproved, isUnfinishedResult } from '../cli/protocol.js';
+import { isApproved } from '../cli/protocol.js';
 import { STAGE_NODE_NAMES } from '../graph/node-names.js';
 import {
   hasStageStep,
@@ -11,10 +10,8 @@ import {
   withNextGeneration,
 } from '../graph/state.js';
 import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.js';
-import { renderWorkOrder } from '../prompts/loader.js';
 import { getDocsDir } from '../runtime/paths.js';
-import type { TBCItem } from '../state/types.js';
-import { answerSummary, askWorkerQuestion, recordWorkerQuestion } from './stage-gates.js';
+import { answerSummary, askWorkerQuestion } from './stage-gates.js';
 import {
   artifactsOf,
   collectedSummary,
@@ -22,6 +19,23 @@ import {
   writeCollectedInputs,
 } from './prd-inputs.js';
 import type { CollectedInputs } from './prd-inputs.js';
+import { figmaDiffStep, figmaFlowStep, figmaQuestionStep } from './figma-flow.js';
+import type { FigmaOptions } from './figma-flow.js';
+import { FIGMA_PROTOTYPE_DIR, FIGMA_SCREENSHOT_DIR } from '../figma/paths.js';
+
+/**
+ * The P0 contract of the Figma stage.
+ *
+ * The stage itself lives in `figma-flow.js`; the names are re-exported here
+ * because the PRD stage is where the design enters the graph.
+ */
+export {
+  checkFigmaP0,
+  figmaTbcItem,
+  figmaWorkOrder,
+  FIGMA_P0_FILES,
+} from './figma-flow.js';
+export { FIGMA_SCREENSHOT_DIR };
 
 /**
  * The PRD stage: the requirements come from the user, not from the model.
@@ -77,121 +91,19 @@ export const STEP_DESIGN = 'design';
  */
 export const DESIGN_STAGE = STAGE;
 
-/** The step that records that the Figma work order was answered. */
-const STEP_FIGMA_DONE = 'figma-done';
-
-/** The step that holds the question a worker raised. */
-const STEP_FIGMA_QUESTION = 'figma-question';
-
 /** The step that records that the user answered the question. */
 const STEP_FIGMA_ANSWERED = 'figma-answered';
-
-/**
- * The files a Figma fetch has to deliver.
- *
- * They are the P0 of the design context: without them the spec stage has
- * nothing to say about the UI, and without a screenshot there is nothing to
- * compare the implementation against.
- */
-export const FIGMA_P0_FILES: ReadonlyArray<string> = [
-  'figma/figma-meta.json',
-  'figma/design-tree.json',
-  'figma/design-tokens.json',
-  'figma/design-context.md',
-];
-
-/** The directory the screenshots have to go to. */
-export const FIGMA_SCREENSHOT_DIR = 'figma/screenshots';
-
-/**
- * Are the Figma P0 files there?
- *
- * @param docsDir - The requirement documents of the run.
- * @returns `ok` plus the relative paths that are missing.
- */
-export function checkFigmaP0(docsDir: string): { ok: boolean; missing: string[] } {
-  const missing: string[] = [];
-
-  for (const relative of FIGMA_P0_FILES) {
-    if (!fs.existsSync(path.join(docsDir, relative))) {
-      missing.push(relative);
-    }
-  }
-
-  const screenshotDir = path.join(docsDir, FIGMA_SCREENSHOT_DIR);
-  const hasScreenshot =
-    fs.existsSync(screenshotDir) &&
-    fs.readdirSync(screenshotDir).some((file) => file.toLowerCase().endsWith('.png'));
-  if (!hasScreenshot) {
-    missing.push(`${FIGMA_SCREENSHOT_DIR}/*.png`);
-  }
-
-  return { ok: missing.length === 0, missing };
-}
-
-/**
- * The Figma work order.
- *
- * The graph never calls Figma itself: the session does, with the MCP tools
- * it already has. The order therefore names the files that have to be
- * written - and the directory the screenshot has to go to, so that the
- * order and its prompt say the same thing.
- *
- * @param docsDir - The requirement documents of the run.
- * @param repoDir - The cloned repository (the working directory of the order).
- * @param figmaUrl - The Figma file the user gave.
- */
-export function figmaWorkOrder(
-  docsDir: string,
-  repoDir: string,
-  figmaUrl: string
-): InterruptPayload {
-  const screenshotDir = path.join(docsDir, FIGMA_SCREENSHOT_DIR);
-  const outputs = [
-    ...FIGMA_P0_FILES.map((relative) => path.join(docsDir, relative)),
-    screenshotDir,
-  ];
-  const context = [
-    '',
-    '## The Figma file of this run',
-    '',
-    figmaUrl,
-    '',
-    'Write the P0 files to the absolute paths listed in `outputs`. The last entry of',
-    `\`outputs\` is the screenshot directory: put at least one png into`,
-    `${screenshotDir} (the name of the file is yours).`,
-    '',
-  ].join('\n');
-
-  const body = renderWorkOrder('figma-fetch', {
-    goal: '抓取這次需求的 Figma P0 資源：設計檔 metadata、設計節點樹、design token、設計說明與截圖。',
-    cwd: repoDir,
-    inputs: [],
-    outputs,
-    outputFormat:
-      '`figma-meta.json`（設計檔 metadata）、`design-tree.json`（設計節點樹）、' +
-      '`design-tokens.json`（design token）、`design-context.md`（給實作者看的設計說明），' +
-      '以及至少一張 png 截圖。',
-  });
-
-  return {
-    audience: 'host',
-    type: 'work_order',
-    role: 'figma_fetch',
-    prompt: `${body}\n${context}`,
-    cwd: repoDir,
-    inputs: [],
-    outputs,
-    resultSchema: 'none',
-  };
-}
 
 /**
  * The PRD stage.
  *
  * @param state - The graph state (`requirementName`, `repoPath`).
+ * @param options - How the Figma stage measures the prototype.
  */
-export async function prdNode(state: GraphState): Promise<NodeOutcome> {
+export async function prdNode(
+  state: GraphState,
+  options?: FigmaOptions
+): Promise<NodeOutcome> {
   const repoDir = state.repoPath;
   const gen = stageGeneration(state, STAGE);
 
@@ -235,34 +147,20 @@ export async function prdNode(state: GraphState): Promise<NodeOutcome> {
     return { kind: 'advance', update, goto: STAGE };
   }
 
-  // ---- Step 2: the Figma P0 files ---------------------------------------
+  // ---- Step 2: the design -----------------------------------------------
+  // **Fetch, prototype, measure.** The flow lives in `figma-flow.js` and
+  // issues at most one work order per execution.
   const figmaUrl = readStageStep(state, STAGE, STEP_FIGMA_URL) ?? '';
-  if (figmaUrl !== '' && !hasStageStep(state, STAGE, figmaDoneStep(gen))) {
-    const docsDir = docsDirOf(state);
-    const result = interrupt(figmaWorkOrder(docsDir, repoDir, figmaUrl));
-    const update = recordStageStep(STAGE, figmaDoneStep(gen), '');
-
-    // **The file system decides, not the worker.** A worker that answers
-    // `status: 'ok'` without writing the files has not done the work, and
-    // the stage has to say so.
-    const missing = checkFigmaP0(docsDir).missing;
-    if (isUnfinishedResult(result) || missing.length > 0) {
-      // A Figma file that cannot be read is not fatal: a requirement
-      // without a UI must not be blocked by it.
-      update.tbcItems = [figmaTbcItem(STAGE, figmaUrl, result, missing)];
-    }
-
-    // A worker that needs a decision it may not make raises a question:
-    // the graph asks the user instead of the worker asking the user.
-    const question = recordWorkerQuestion(result, {
+  if (figmaUrl !== '') {
+    const outcome = await figmaFlowStep(state, {
       stage: STAGE,
-      step: figmaQuestionStep(gen),
+      docsDir: docsDirOf(state),
+      repoDir,
+      figmaUrl,
+      gen,
+      options,
     });
-    if (question !== undefined) {
-      update.stageSteps = { ...(update.stageSteps ?? {}), ...(question.stageSteps ?? {}) };
-    }
-
-    return { kind: 'advance', update, goto: STAGE };
+    if (outcome !== undefined) return outcome;
   }
 
   // ---- Step 3: the question the worker raised ----------------------------
@@ -280,10 +178,15 @@ export async function prdNode(state: GraphState): Promise<NodeOutcome> {
   // The payload says **what the graph actually collected** - the PRD came
   // from this file, the design was described in these words, these other
   // documents were read. The user approves without having to guess.
+  //
+  // The prototype and the measurement are part of that: the user can open
+  // the HTML page and see how far the design was reproduced.
   const answer = interrupt({
     audience: 'user',
     type: 'confirm_prd',
     collected: collectedSummaryOf(state),
+    prototype: path.join(docsDirOf(state), FIGMA_PROTOTYPE_DIR, 'index.html'),
+    diff: readStageStep(state, STAGE, figmaDiffStep()),
   });
   if (!isApproved(answer)) {
     // The user does not want this PRD: the next generation collects it
@@ -379,41 +282,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/**
- * The TBC a failed Figma fetch leaves behind.
- *
- * It is not blocking: a requirement without a UI must not be blocked by it.
- *
- * @param stage - The stage that asked for the files (`prd`, `spec`).
- * @param figmaUrl - The Figma file the run works on.
- * @param result - What the worker reported (may be `undefined`).
- * @param missing - The files that are not on disk (empty when unknown).
- */
-export function figmaTbcItem(
-  stage: string,
-  figmaUrl: string,
-  result: unknown,
-  missing: string[] = []
-): TBCItem {
-  const because =
-    missing.length > 0
-      ? `the P0 files are not all there (missing: ${missing.join(', ')})`
-      : summaryOf(result);
-  return {
-    id: `TBC-FIGMA-${stage}`,
-    description: `the Figma P0 files could not be fetched (${figmaUrl}): ${because}`,
-    blocking: false,
-    resolved: false,
-    createdAt: new Date().toISOString(),
-  };
-}
-
-/** What the worker said about the failure. */
-function summaryOf(result: unknown): string {
-  const summary = answerText(result, 'summary');
-  return summary === '' ? 'the Figma fetch did not finish' : summary;
-}
-
 /** Where the requirement documents of the run live. */
 function docsDirOf(state: GraphState): string {
   return getDocsDir(state.requirementName, state.repoPath);
@@ -422,16 +290,6 @@ function docsDirOf(state: GraphState): string {
 /** The step that records the collection of a generation. */
 function collectedStep(gen: number): string {
   return `collected-${gen}`;
-}
-
-/** The step that records the answered Figma work order of a generation. */
-function figmaDoneStep(gen: number): string {
-  return `${STEP_FIGMA_DONE}-${gen}`;
-}
-
-/** The step that holds the question a worker raised in a generation. */
-function figmaQuestionStep(gen: number): string {
-  return `${STEP_FIGMA_QUESTION}-${gen}`;
 }
 
 /** The step that records the answer of the user in a generation. */

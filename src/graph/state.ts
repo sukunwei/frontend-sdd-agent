@@ -37,7 +37,7 @@ export const SddStateAnnotation = Annotation.Root({
   tasks: Annotation<Task[]>({ reducer: mergeById, default: () => [] }),
   currentTaskIndex: Annotation<number>({ reducer: (_p, n) => n, default: () => 0 }),
   tddSubStage: Annotation<TddSubStage>({ reducer: (_p, n) => n, default: () => 'pending' }),
-  lastReview: Annotation<ReviewResult | null>({ reducer: (_p, n) => n, default: () => null }),
+  lastReviews: Annotation<ReviewResult[]>({ reducer: (_p, n) => n, default: () => [] }),
   tddAttempts: Annotation<number>({ reducer: (_p, n) => n, default: () => 0 }),
   verification: Annotation<VerificationState>({ reducer: mergeVerification, default: () => ({ checks: [] }) }),
   blockers: Annotation<Blocker[]>({ reducer: mergeBlockers, default: () => [] }),

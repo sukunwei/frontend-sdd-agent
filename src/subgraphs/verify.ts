@@ -2,17 +2,27 @@ import { interrupt } from '@langchain/langgraph';
 import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.js';
 import { actionOf } from '../nodes/bootstrap.js';
 import { checkLogPath, runCheck, VERIFY_CHECKS } from '../nodes/verify-checks.js';
-import type { CheckRunner } from '../nodes/verify-checks.js';
+import type { CheckResult, CheckRunner } from '../nodes/verify-checks.js';
 import { getDocsDir } from '../runtime/paths.js';
 import type { Blocker, VerificationCheck } from '../state/types.js';
 
 /**
  * The verification stage: four deterministic gates, no LLM.
  *
- * The gates run in a fixed order (`lint:ts` → `lint` → `test` → `e2e`) and
- * stop at the first one that fails - a type error makes the test result
- * meaningless, and a failing test makes the e2e run meaningless. The gates
- * behind the failure stay `pending` in the state.
+ * The gates run in a fixed order (`lint:ts` → `lint` → `test` → `e2e`).
+ *
+ * - `lint:ts` runs first and **stops the pass when it fails**: a type
+ *   error makes the result of the other gates meaningless.
+ * - `lint` runs next, on its own, because it rewrites the source code
+ *   (`--fix`) - a gate that reads the source code at the same time would
+ *   read a half-written file.
+ * - `test` and `e2e` run **at the same time**: they do not touch the
+ *   source code, and the e2e run is usually the slowest one, so the pass
+ *   takes the slower of the two instead of the sum of the two.
+ *
+ * A failing `test` does **not** stop the e2e run any more: the two are
+ * peers now, and one of them failing says nothing about the other. The
+ * gates behind a failure of the first two stay `pending` in the state.
  *
  * **The node never touches the business code.** It runs commands and records
  * what it saw. The only thing that writes is `eslint --fix`, and that is the
@@ -145,7 +155,19 @@ function pendingChecks(): VerificationCheck[] {
 }
 
 /**
- * Run the gates in order.
+ * Run the gates.
+ *
+ * The order is `lint:ts` → `lint` → (`test` ∥ `e2e`):
+ *
+ * - `lint:ts` runs first because a type error makes the result of the
+ *   other gates meaningless.
+ * - `lint` runs alone because it carries `--fix`: it **changes the source
+ *   code**, and a gate that reads the source code at the same time would
+ *   read a half-written file.
+ * - `test` and `e2e` do not touch the source code (jest writes snapshots,
+ *   playwright writes `test-results/`), and the e2e run is usually the
+ *   slowest one - so they run **at the same time** and the pass takes the
+ *   slower of the two instead of the sum of the two.
  *
  * A gate that fails is retried up to {@link MAX_CHECK_RETRIES} times. A
  * gate that can repair itself (`eslint --fix`) reports `fixed` when the
@@ -159,21 +181,10 @@ async function runGates(
   const checks: VerificationCheck[] = [];
   const runOptions = { docsDir, timeoutMs: opts.timeoutMs, runner: opts.runner };
 
-  for (const spec of VERIFY_CHECKS) {
-    let retries = 0;
-    let result = await runCheck(spec.name, repoDir, runOptions);
-    while (result.status === 'failed' && retries < MAX_CHECK_RETRIES) {
-      retries += 1;
-      result = await runCheck(spec.name, repoDir, runOptions);
-    }
-
-    checks.push({
-      name: spec.name,
-      status: result.status,
-      retries,
-      lastRunAt: new Date().toISOString(),
-      ...(result.status === 'failed' ? { error: summarize(result.log, result.exitCode) } : {}),
-    });
+  // ---- First: the two gates that change (or read) the source code ------
+  for (const spec of VERIFY_CHECKS.filter((s) => s.name === 'lint:ts' || s.name === 'lint')) {
+    const { result, retries } = await runWithRetries(spec, repoDir, runOptions);
+    checks.push(toCheck(spec, result, retries));
 
     if (result.status === 'failed') {
       // The gates behind a failed one are not run - their result would be
@@ -181,11 +192,50 @@ async function runGates(
       for (const rest of VERIFY_CHECKS.slice(checks.length)) {
         checks.push({ name: rest.name, status: 'pending', retries: 0 });
       }
-      break;
+      return checks;
     }
   }
 
+  // ---- Then: the two gates that only read it, at the same time ----------
+  const tail = VERIFY_CHECKS.filter((s) => s.name === 'test' || s.name === 'e2e');
+  const results = await Promise.all(
+    tail.map(async (spec) => runWithRetries(spec, repoDir, runOptions))
+  );
+  tail.forEach((spec, index) => {
+    checks.push(toCheck(spec, results[index].result, results[index].retries));
+  });
+
   return checks;
+}
+
+/** Run one gate, retrying it while it fails. */
+async function runWithRetries(
+  spec: (typeof VERIFY_CHECKS)[number],
+  repoDir: string,
+  runOptions: { docsDir: string; timeoutMs?: number; runner?: CheckRunner }
+): Promise<{ result: CheckResult; retries: number }> {
+  let retries = 0;
+  let result = await runCheck(spec.name, repoDir, runOptions);
+  while (result.status === 'failed' && retries < MAX_CHECK_RETRIES) {
+    retries += 1;
+    result = await runCheck(spec.name, repoDir, runOptions);
+  }
+  return { result, retries };
+}
+
+/** The record of one gate. */
+function toCheck(
+  spec: (typeof VERIFY_CHECKS)[number],
+  result: CheckResult,
+  retries: number
+): VerificationCheck {
+  return {
+    name: spec.name,
+    status: result.status,
+    retries,
+    lastRunAt: new Date().toISOString(),
+    ...(result.status === 'failed' ? { error: summarize(result.log, result.exitCode) } : {}),
+  };
 }
 
 /** The payload of the gate that asks the user what to do with a failure. */

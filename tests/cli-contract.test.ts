@@ -52,6 +52,23 @@ describe('CLI 合約', () => {
     expect(JSON.parse(captured.err).code).toBe('invalid_arguments');
   });
 
+  it('figma-diff 沒有 --docs 時回 2（用法錯誤），並把錯誤寫進 stderr', async () => {
+    const rc = await runCli(['figma-diff']);
+    const captured = io.take();
+    expect(rc).toBe(2);
+    expect(captured.out).toBe('');
+    expect(JSON.parse(captured.err).code).toBe('invalid_arguments');
+  });
+
+  it('figma-diff 在沒有截圖時回 0（沒有東西可比）', async () => {
+    const docs = path.join(ws, 'docs', 'demo');
+    fs.mkdirSync(docs, { recursive: true });
+    const rc = await runCli(['figma-diff', '--docs', docs]);
+    const captured = io.take();
+    expect(rc).toBe(0);
+    expect(JSON.parse(captured.out).hardFailures).toBe(0);
+  });
+
   it('user 閘口不能用 complete 推進，只能用 approve', async () => {
     const rc1 = await runCli(['start', '--task', 'dup-test', '--repo', 'file:///nonexistent'], { checkpointPath: cp, lockPath: lockFile });
     io.take();
@@ -427,7 +444,10 @@ describe('CLI 合約', () => {
       status: 'ok',
       summary: 'reviewed',
       changedFiles: [],
-      review: { role: 'spec', verdict: 'pass', issues: [] },
+      reviews: [
+        { role: 'spec', verdict: 'pass', issues: [] },
+        { role: 'quality', verdict: 'pass', issues: [] },
+      ],
     });
     const rc = await runCli(['complete', '--task', 'c6', '--result', result], { graph });
     io.take();
