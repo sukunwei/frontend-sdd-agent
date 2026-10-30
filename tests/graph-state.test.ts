@@ -15,7 +15,7 @@ describe('graph state', () => {
     expect(out.currentTaskIndex).toBe(0);   // ← 這幾個值只可能來自 default
     expect(out.tasks).toEqual([]);
     expect(out.bootstrapped).toBe(false);
-    expect(out.lastReview).toBeNull();
+    expect(out.lastReviews).toEqual([]);
   });
 
   it('每一個欄位都要有 default（含 version 與時間戳）', async () => {

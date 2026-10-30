@@ -22,6 +22,8 @@ import {
   figmaWorkOrder,
   STEP_DESIGN,
 } from '../nodes/prd.js';
+import { figmaDiffStep, figmaFlowStep } from '../nodes/figma-flow.js';
+import type { FigmaOptions } from '../nodes/figma-flow.js';
 import { parseAcIds, parseQuestions, parseTbcItems } from '../parsers/ids.js';
 import { DESIGN_FILE, REFS_DIR } from '../nodes/prd-inputs.js';
 import { renderWorkOrder } from '../prompts/loader.js';
@@ -145,7 +147,7 @@ interface SpecReading {
 
 /** The spec node and its exit. */
 export interface SpecNode {
-  (state: GraphState): Promise<NodeOutcome>;
+  (state: GraphState, options?: FigmaOptions): Promise<NodeOutcome>;
   /** What the documents of the run say. */
   exit(state: GraphState, docsDir: string): SpecExit;
 }
@@ -188,7 +190,10 @@ export function specExit(state: GraphState, docsDir: string): SpecExit {
 export const specNode: SpecNode = Object.assign(specNodeImpl, { exit: specExit });
 
 /** The implementation of the node. */
-async function specNodeImpl(state: GraphState): Promise<NodeOutcome> {
+async function specNodeImpl(
+  state: GraphState,
+  options?: FigmaOptions
+): Promise<NodeOutcome> {
   const repoDir = state.repoPath;
   const gen = stageGeneration(state, STAGE);
 
@@ -251,6 +256,33 @@ async function specNodeImpl(state: GraphState): Promise<NodeOutcome> {
       }
       return { kind: 'advance', update, goto: STAGE };
     }
+  }
+
+  // ---- The prototype ----------------------------------------------------
+  // The design may reach the run late: the user decides at the
+  // `figma_missing` gate whether to fetch it. When the design is there, the
+  // prototype is built too - the spec author needs the same visual truth
+  // the developer will get, and the prototype is what proves that the
+  // fetched files carry the design.
+  //
+  // The PRD stage has usually done this already. It is not repeated: the
+  // measurement it made is the one everybody reads.
+  const prdMeasured = readStageStep(state, DESIGN_STAGE, figmaDiffStep());
+  if (
+    prdMeasured === undefined &&
+    worthAskingAboutTheDesign(state) &&
+    checkFigmaP0(docsDirOf(state)).ok
+  ) {
+    const outcome = await figmaFlowStep(state, {
+      stage: STAGE,
+      docsDir: docsDirOf(state),
+      repoDir,
+      figmaUrl: figmaUrlOf(state),
+      gen,
+      options,
+      fetch: false,
+    });
+    if (outcome !== undefined) return outcome;
   }
 
   // ---- Step 2: the question a worker raised ------------------------------

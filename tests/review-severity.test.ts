@@ -14,7 +14,7 @@ function severityList(file: string): string {
 
 describe('評審的嚴重度', () => {
   it('schema 要認得 prompt 用的每一個嚴重度', () => {
-    for (const file of ['spec-reviewer.md', 'quality-reviewer.md']) {
+    for (const file of ['reviewer.md']) {
       const list = severityList(file);
       expect(list).not.toBe('');
       for (const severity of list.split('|').map((s) => s.trim())) {
@@ -28,12 +28,14 @@ describe('評審的嚴重度', () => {
     }
   });
 
-  it('兩個審查者的嚴重度清單要一樣', () => {
-    expect(severityList('spec-reviewer.md')).toBe(severityList('quality-reviewer.md'));
+  it('審查者只有一份 prompt：嚴重度清單不會漂移', () => {
+    const files = fs.readdirSync(PROMPTS).filter((name) => name.endsWith('-reviewer.md'));
+    expect(files).toEqual([]);
+    expect(fs.existsSync(path.join(PROMPTS, 'reviewer.md'))).toBe(true);
   });
 
   it('品質審查者的門檻中間不能有洞（2 或 3 個 high 要 fail）', () => {
-    const content = fs.readFileSync(path.join(PROMPTS, 'quality-reviewer.md'), 'utf-8');
+    const content = fs.readFileSync(path.join(PROMPTS, 'reviewer.md'), 'utf-8');
     expect(content).toContain('high 問題 2 個或以上');
     expect(content).toContain('high 問題 0 或 1 個');
     expect(content).toContain('2 或 3 個 high 問題');

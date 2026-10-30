@@ -120,6 +120,52 @@ describe('verify 關卡順序', () => {
     });
   });
 
+  it('test 失敗時 e2e 仍然有跑（兩個關卡是同時的）', async () => {
+    await withTempDir(async (dir) => {
+      const calls: string[][] = [];
+      const { graph } = buildVerifyGraph({
+        dbPath: join(dir, 'cp.sqlite'),
+        repoDir: dir,
+        runner: async (cmd) => {
+          calls.push(cmd);
+          const failed = cmd[1] === 'jest';
+          return { code: failed ? 1 : 0, stdout: '', stderr: failed ? 'boom' : '' };
+        },
+      });
+      const cfg = { configurable: { thread_id: 'thr-verify-parallel' } };
+
+      await graph.invoke({ requirementName: 'demo' } as never, cfg);
+
+      const after = await readSnapshot(graph, cfg);
+      const checks = (after.values.verification as {
+        checks: Array<{ name: string; status: string }>;
+      }).checks;
+      expect(checks.find((check) => check.name === 'test')?.status).toBe('failed');
+      // e2e 跟 test 是同時跑的：test 失敗不會讓 e2e 沒跑。
+      expect(checks.find((check) => check.name === 'e2e')?.status).toBe('passed');
+      expect(calls.some((cmd) => cmd[1] === 'playwright')).toBe(true);
+    });
+  });
+
+  it('lint 會改原始碼，所以它跟 test 不能同時跑', async () => {
+    await withTempDir(async (dir) => {
+      const calls: string[][] = [];
+      const { graph } = buildVerifyGraph({
+        dbPath: join(dir, 'cp.sqlite'),
+        repoDir: dir,
+        runner: async (cmd) => {
+          calls.push(cmd);
+          return { code: 0, stdout: '', stderr: '' };
+        },
+      });
+      const cfg = { configurable: { thread_id: 'thr-verify-order' } };
+
+      await graph.invoke({ requirementName: 'demo' } as never, cfg);
+
+      expect(calls.map((cmd) => cmd[1])).toEqual(['tsc', 'eslint', 'jest', 'playwright']);
+    });
+  });
+
   it('失敗的關卡最多重試兩次，後面的關卡不跑', async () => {
     await withTempDir(async (dir) => {
       const calls: string[][] = [];

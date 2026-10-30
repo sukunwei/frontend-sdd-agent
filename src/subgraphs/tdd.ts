@@ -130,13 +130,17 @@ export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
     case 'pending':
       return developerStep(state, task);
     case 'developer_done':
-      return reviewStep(state, task, 'spec');
-    case 'spec_review_done':
-      return reviewStep(state, task, 'quality');
-    case 'quality_review_done':
+      return reviewStep(state, task);
+    case 'review_done':
       return finishTask(state, tasks.length);
     case 'completed':
       return startCycle();
+    default:
+      // **A checkpoint of an older version.** The sub-stage values changed
+      // when the two reviews were merged. A run that was parked between the
+      // two reviews has to go on: the combined review still has to happen,
+      // because the quality half of it never ran.
+      return reviewStep(state, task);
   }
 }
 
@@ -208,16 +212,12 @@ async function developerStep(state: GraphState, task: Task): Promise<NodeOutcome
   // The worker did not finish the task: that is a failed attempt too. The
   // reason goes into the ledger, so that the next order says what went
   // wrong.
-  return escalateTask(state, task, undefined, outcome.summary);
+  return escalateTask(state, task, [], outcome.summary);
 }
 
 /** The review step of a task. */
-async function reviewStep(
-  state: GraphState,
-  task: Task,
-  role: 'spec' | 'quality'
-): Promise<NodeOutcome> {
-  const order = reviewWorkOrder(state, task, role);
+async function reviewStep(state: GraphState, task: Task): Promise<NodeOutcome> {
+  const order = reviewWorkOrder(state, task);
   const answer = interrupt(workOrderPayload(order));
 
   if (isRejectionMarker(answer)) {
@@ -252,22 +252,33 @@ async function reviewStep(
     return { kind: 'advance', update: {}, goto: STAGE_NODE_NAMES.tdd };
   }
 
-  const review = readReview(answer, role);
-  if (review === undefined) {
+  // **The reviewer answers two questions in one order.** Both verdicts are
+  // kept: the developer of the next attempt has to see the spec verdict
+  // (the task was not done) and the quality verdict (the task was done
+  // badly) - the old loop overwrote the first one with the second.
+  const reviews = [readReview(answer, 'spec'), readReview(answer, 'quality')].filter(
+    (review): review is ReviewResult => review !== undefined
+  );
+  if (reviews.length === 0) {
     // `validateCompletion` accepted the review, so this cannot happen - but
     // the order must not be answered with a step that was never checked.
     return { kind: 'advance', update: {}, goto: STAGE_NODE_NAMES.tdd };
   }
 
-  if (review.verdict === 'fail') {
-    return escalateTask(state, task, review);
+  const failed = reviews.find((review) => review.verdict === 'fail');
+  if (failed !== undefined) {
+    // **Both verdicts go back with the failure.** The developer of the next
+    // attempt has to see the spec complaint ("the task was not done") and
+    // the quality complaint ("the task was done badly") - they are two
+    // different kinds of work.
+    return escalateTask(state, task, reviews);
   }
 
   return {
     kind: 'advance',
     update: {
-      tddSubStage: role === 'spec' ? 'spec_review_done' : 'quality_review_done',
-      lastReview: review,
+      tddSubStage: 'review_done',
+      lastReviews: reviews,
       ...recordInvalidReviews(0),
     },
     goto: STAGE_NODE_NAMES.tdd,
@@ -299,7 +310,7 @@ function handleRejection(
   const count = rejectionCount(state, reason) + 1;
   if (count >= REJECTION_LIMIT) {
     // The second rejection of the same kind: the task escalates.
-    return escalateTask(state, task, undefined);
+    return escalateTask(state, task, []);
   }
   return {
     kind: 'advance',
@@ -331,7 +342,7 @@ function handleRejection(
 function escalateTask(
   state: GraphState,
   task: Task,
-  review: ReviewResult | undefined,
+  reviews: ReviewResult[],
   failure?: string
 ): NodeOutcome {
   const attempts = (state.tddAttempts ?? 0) + 1;
@@ -345,7 +356,7 @@ function escalateTask(
         update: {
           tddAttempts: attempts,
           tddSubStage: 'pending',
-          ...(review ? { lastReview: review } : {}),
+          ...(reviews.length > 0 ? { lastReviews: reviews } : {}),
           ...recordInvalidReviews(0),
           // The order goes out again from the start: the rejections of the
           // last attempt are counted from zero.
@@ -371,7 +382,7 @@ function escalateTask(
         kind: 'advance',
         update: {
           tddAttempts: attempts,
-          ...(review ? { lastReview: review } : {}),
+          ...(reviews.length > 0 ? { lastReviews: reviews } : {}),
           ...reason,
           ...recordGate({
             type: escalation.interrupt.type,
@@ -389,7 +400,7 @@ function escalateTask(
         kind: 'advance',
         update: {
           tddAttempts: attempts,
-          ...(review ? { lastReview: review } : {}),
+          ...(reviews.length > 0 ? { lastReviews: reviews } : {}),
           ...reason,
           blockers: [blockerFor(task, 'the task failed too often to be worked', 'blocked')],
           ...recordGate({
@@ -495,7 +506,7 @@ function startCycle(): NodeOutcome {
     update: {
       tddSubStage: 'pending',
       tddAttempts: 0,
-      lastReview: null,
+      lastReviews: [],
       ...recordInvalidReviews(0),
       ...recordMissingOutputs(0),
       ...recordDeveloperReport({ summary: '', changedFiles: [] }),
@@ -521,11 +532,18 @@ function workOrderPayload(order: WorkOrder): InterruptPayload {
  * has to be asked again.
  */
 function readReview(answer: unknown, role: 'spec' | 'quality'): ReviewResult | undefined {
-  const result = answer as { review?: unknown } | undefined;
-  const parsed = ReviewResultSchema.safeParse(result?.review);
-  if (!parsed.success) return undefined;
-  if (parsed.data.role !== role) return undefined;
-  return parsed.data;
+  const result = answer as { review?: unknown; reviews?: unknown } | undefined;
+  // The combined reviewer answers with a list; a worker that only did one
+  // of the two answers with a single review.
+  const list = Array.isArray(result?.reviews) ? result.reviews : [];
+  for (const item of list) {
+    const parsed = ReviewResultSchema.safeParse(item);
+    if (parsed.success && parsed.data.role === role) return parsed.data;
+  }
+  const single = ReviewResultSchema.safeParse(result?.review);
+  if (!single.success) return undefined;
+  if (single.data.role !== role) return undefined;
+  return single.data;
 }
 
 /**

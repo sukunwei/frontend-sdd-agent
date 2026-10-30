@@ -27,9 +27,9 @@ import type {
  *    poisoning the reader with an exception. The version literal still
  *    rejects any document that claims a different format.
  *
- * The `L` complexity is deliberately absent: `Complexity` (what the state
- * stores) is `'S' | 'M'`, while `ParsedComplexity` (what `tasks.md` may
- * contain) keeps the wide type so the parser can detect and reject an `L`.
+ * The `L` complexity is legal: an `L` task is a single behaviour that spans
+ * several files. The task-split gate is where an `L` that does not look
+ * like a single behaviour is rejected.
  */
 
 export const STAGES = [
@@ -43,13 +43,7 @@ export const STAGES = [
   'completed',
 ] as const;
 
-export const TDD_SUB_STAGES = [
-  'pending',
-  'developer_done',
-  'spec_review_done',
-  'quality_review_done',
-  'completed',
-] as const;
+export const TDD_SUB_STAGES = ['pending', 'developer_done', 'review_done', 'completed'] as const;
 
 export const VERIFICATION_CHECK_NAMES = ['lint:ts', 'lint', 'test', 'e2e'] as const;
 
@@ -74,8 +68,7 @@ export const StageSchema: z.ZodType<Stage> = z.enum(STAGES);
 
 export const TddSubStageSchema: z.ZodType<TddSubStage> = z.enum(TDD_SUB_STAGES);
 
-/** No 'L' here on purpose - see the module comment. */
-export const ComplexitySchema: z.ZodType<Complexity> = z.enum(['S', 'M']);
+export const ComplexitySchema: z.ZodType<Complexity> = z.enum(['S', 'M', 'L']);
 
 export const TaskSchema: z.ZodType<Task> = z.object({
   id: z.string(),
@@ -162,7 +155,7 @@ export const WorkflowStateSchema = z.object({
   tasks: z.array(TaskSchema).default([]),
   currentTaskIndex: z.number().default(0),
   tddSubStage: TddSubStageSchema.default('pending'),
-  lastReview: ReviewResultSchema.nullable().default(null),
+  lastReviews: z.array(ReviewResultSchema).default([]),
   tddAttempts: z.number().default(0),
   verification: VerificationStateSchema.default({ checks: [] }),
   blockers: z.array(BlockerSchema).default([]),

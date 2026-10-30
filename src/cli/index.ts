@@ -5,8 +5,10 @@ import { Command } from '@langchain/langgraph';
 import { z } from 'zod';
 import { buildGraph } from '../graph/compile.js';
 import type { CompiledSddGraph } from '../graph/compile.js';
+import { measureFidelity } from '../figma/fidelity.js';
 import type { GraphState } from '../graph/state.js';
 import { actionOf } from '../nodes/bootstrap.js';
+import { reviewRoles } from '../nodes/review.js';
 import { ArtifactStore } from '../persistence/artifact-store.js';
 import { createCheckpointer } from '../persistence/checkpoint.js';
 import { forceUnlock, releaseLock, validateLockOwnership } from '../runtime/branch-lock.js';
@@ -36,6 +38,7 @@ import type { RejectionReason, WorkOrder } from './protocol.js';
  * sdd-graph status   --task <n>
  * sdd-graph stop     --task <n> [--force]
  * sdd-graph change   --task <n>          （v1 只預留：回 1 not_implemented）
+ * sdd-graph figma-diff --docs <dir> [--repo <dir>]
  * ```
  *
  * **Exit codes** are the contract; the JSON envelope only says what
@@ -51,6 +54,16 @@ import type { RejectionReason, WorkOrder } from './protocol.js';
  * (ask a human) may only be advanced by `approve`, a `host` interrupt (work
  * an order) only by `complete`. Crossing the two is an error, not a
  * convenience.
+ *
+ * **`figma-diff` is the exception**: it does not touch the graph, and its
+ * caller has to tell "the prototype does not match the design" apart from
+ * "the command could not run". It therefore has its own exit codes:
+ *
+ * | exit | meaning                                              |
+ * |------|------------------------------------------------------|
+ * | 0    | measured, no hard failure                            |
+ * | 1    | measured, at least one hard failure                   |
+ * | 2    | the command could not run (bad arguments)             |
  *
  * The error codes the host may see on stderr: `invalid_arguments`,
  * `no_checkpoint`, `audience_mismatch`, `invalid_result`, `invalid_payload`,
@@ -85,6 +98,7 @@ export interface RunCliOptions {
  */
 const WireWorkerResultSchema = WorkerResultSchema.extend({
   review: z.unknown().optional(),
+  reviews: z.unknown().optional(),
 });
 
 /** A worker result as it arrives over the wire. */
@@ -136,6 +150,8 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         return await cmdStop(args, opts);
       case 'change':
         return cmdChange();
+      case 'figma-diff':
+        return await cmdFigmaDiff(args);
       default:
         throw new CliError('invalid_arguments', `unknown command: ${args.command || '<none>'}`);
     }
@@ -287,8 +303,13 @@ async function cmdComplete(args: ParsedArgs, opts: RunCliOptions): Promise<numbe
       //
       // A worker that says it did not finish (`status: 'failed'`) is not a
       // broken review - the result goes to the graph as it is.
-      const hasReview = result.review !== undefined;
-      const reviewOk = ReviewResultSchema.safeParse(result.review).success;
+      //
+      // **The combined reviewer answers two questions in one order.** The
+      // answer may carry the reviews in `reviews` or in `review`; either
+      // way both roles have to be there.
+      const roles = reviewRoles(result.reviews, result.review);
+      const hasReview = result.review !== undefined || result.reviews !== undefined;
+      const reviewOk = roles.has('spec') && roles.has('quality');
       const expectsReview = order.resultSchema === 'review' && result.status === 'ok';
       if (!reviewOk && (hasReview || expectsReview)) {
         return await rejectOrder(graph, config, threadId, pending, order, 'invalid_review');
@@ -553,6 +574,56 @@ function cmdChange(): never {
     'not_implemented',
     '/sdd-graph:change 尚未實作：v1 只預留入口，圖狀態仍由階段路由推進。'
   );
+}
+
+/**
+ * `figma-diff --docs <dir> [--repo <dir>]`: measure the prototype against
+ * the Figma screenshots.
+ *
+ * The worker calls this to iterate on the prototype, the graph calls it to
+ * produce the report that goes into the requirement documents. Both get the
+ * same numbers, because both call the same code.
+ *
+ * **The exit codes are the contract**:
+ *
+ * | exit | meaning                                              |
+ * |------|------------------------------------------------------|
+ * | 0    | measured, no hard failure                            |
+ * | 1    | measured, at least one hard failure                   |
+ * | 2    | the command could not run (bad arguments)             |
+ *
+ * A hard failure is a frame that could not be measured at all - no
+ * prototype page, a page that does not render, a screenshot of a different
+ * size. A frame that was measured and differs a little is **not** a hard
+ * failure: the pixel ratio is a hint, not a verdict.
+ */
+async function cmdFigmaDiff(args: ParsedArgs): Promise<number> {
+  const docsDir = args.flags.get('docs');
+  if (docsDir === undefined || docsDir === '') {
+    writeErr(envelope('error', { code: 'invalid_arguments', message: '--docs is required' }));
+    return 2;
+  }
+  if (!fs.existsSync(docsDir)) {
+    writeErr(
+      envelope('error', {
+        code: 'invalid_arguments',
+        message: `no such docs directory: ${docsDir}`,
+      })
+    );
+    return 2;
+  }
+
+  const repoDir = args.flags.get('repo') ?? process.cwd();
+  const report = await measureFidelity({ docsDir, repoDir });
+
+  emitResult({
+    command: 'figma-diff',
+    frames: report.frames,
+    hardFailures: report.hardFailures,
+    report: report.mdPath,
+  });
+
+  return report.hardFailures > 0 ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ */

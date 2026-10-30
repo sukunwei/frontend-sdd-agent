@@ -128,7 +128,7 @@ export function developerWorkOrder(state: GraphState, task: Task): WorkOrder {
  * last attempt got wrong are appended - a session that resumes in a different
  * conversation has to be able to work the order from the document alone.
  *
- * @param state - The graph state (`lastReview` and the ledger of the loop).
+ * @param state - The graph state (`lastReviews` and the ledger of the loop).
  * @param task - The task to implement.
  * @param scope - The files the task is about (the outputs of the order).
  */
@@ -149,9 +149,9 @@ export function developerPrompt(state: GraphState, task: Task, scope: TaskScope)
   sections.push(taskSection(task));
   sections.push(scopeSection(scope));
 
-  const review = state.lastReview;
-  if (review) {
-    sections.push(reviewSection(review));
+  const reviews = state.lastReviews ?? [];
+  if (reviews.length > 0) {
+    sections.push(reviewSection(reviews));
   }
 
   const failure = readDeveloperFailure(state);
@@ -345,17 +345,26 @@ export function taskSection(task: Task): string {
   return lines.join('\n');
 }
 
-/** What the last review complained about. */
-function reviewSection(review: ReviewResult): string {
+/**
+ * What the last review complained about.
+ *
+ * **Both verdicts are shown.** The spec verdict ("the task was not done")
+ * and the quality verdict ("the task was done badly") are two different
+ * kinds of complaint, and the developer of the next attempt has to see
+ * both.
+ */
+function reviewSection(reviews: ReviewResult[]): string {
   const lines: string[] = ['## 上一次評審的結果'];
-  lines.push('');
-  lines.push(`評審結論：${review.verdict}`);
-  if (review.issues.length > 0) {
+  for (const review of reviews) {
     lines.push('');
-    lines.push('**必須修掉的問題**:');
-    for (const issue of review.issues) {
-      const where = issue.line === undefined ? issue.file : `${issue.file}:${issue.line}`;
-      lines.push(`- [${issue.severity}] ${where} —— ${issue.message}`);
+    lines.push(`**${review.role} 審查**：${review.verdict}`);
+    if (review.issues.length > 0) {
+      lines.push('');
+      lines.push('**必須修掉的問題**:');
+      for (const issue of review.issues) {
+        const where = issue.line === undefined ? issue.file : `${issue.file}:${issue.line}`;
+        lines.push(`- [${issue.severity}] ${where} —— ${issue.message}`);
+      }
     }
   }
   lines.push('');
@@ -405,7 +414,7 @@ export function taskScope(repoDir: string, docsDir: string, task: Task): TaskSco
  */
 export function taskTestPath(task: Task): string {
   const slug = task.id.replace(/^TASK-/, '');
-  return `src/__tests__/${slug}.test.tsx`;
+  return `src/__tests__/${slug}.test.ts`;
 }
 
 /** Is this path a test file? */

@@ -66,10 +66,18 @@ function constraints(prompt: string): string {
 const WRITE_GRANT = /只(改|寫)[^。\n]*列出的路徑/;
 
 /** The roles that only look at the code. */
-const REVIEWERS = ['spec-reviewer', 'quality-reviewer'];
+const REVIEWERS = ['reviewer'];
 
 /** The roles that write something. */
-const WRITERS = ['spec-writer', 'e2e-planner', 'task-splitter', 'figma-fetch', 'developer'];
+const WRITERS = [
+  'spec-writer',
+  'e2e-planner',
+  'task-splitter',
+  'figma-fetch',
+  'figma-prototype',
+  'figma-polish',
+  'developer',
+];
 
 describe('工作單正文', () => {
   it('模板變數會被取代', () => {
@@ -100,6 +108,48 @@ describe('工作單正文', () => {
     for (const role of ROLES) {
       expect(promptVariables(role)).toEqual(['goal', 'cwd', 'inputs', 'outputs', 'outputFormat']);
     }
+  });
+
+  it('task 拆分的工作單必須說明以效率為準的粒度規則', () => {
+    const out = renderPrompt('task-splitter', VARS);
+    expect(out).toContain('3～8 條');           // 每個 task 的驗收條件數
+    expect(out).toContain('ceil(AC 數 / 4)');   // task 數的預算
+    expect(out).toContain('測試不要獨立成 task');
+    // L 是合法的 —— 不准再說「不得有 L」。
+    expect(out).not.toContain('不得**出現 `L`');
+  });
+
+  it('原型的工作單必須叫得出 figma-implement-design skill 與量測命令', () => {
+    const out = renderPrompt('figma-prototype', VARS);
+    expect(out).toContain('figma-implement-design');
+    expect(out).toContain('sdd-graph figma-diff');
+  });
+
+  it('原型的工作單必須量「目標專案」，不是工人現在所在的目錄', () => {
+    const out = renderPrompt('figma-prototype', VARS);
+    expect(out).toMatch(/sdd-graph figma-diff --docs .* --repo \/repo/);
+  });
+
+  it('task 拆分的工作單要說對來回次數（審查合併之後是兩次）', () => {
+    const out = renderPrompt('task-splitter', VARS);
+    expect(out).toContain('兩次來回');
+    expect(out).not.toContain('三次來回');
+  });
+
+  it('developer 的工作單要說明原型只有「有 Figma 設計」時才有', () => {
+    const out = renderPrompt('developer', VARS);
+    expect(out).toContain('有 Figma 設計');
+  });
+
+  it('原型的工作單必須說明 frameKey 的命名規則（截圖與頁子靠它配對）', () => {
+    const out = renderPrompt('figma-prototype', VARS);
+    expect(out).toContain('frameKey');
+    expect(out).toContain('1-23');
+  });
+
+  it('修補的工作單不得叫工人去追像素比例', () => {
+    const out = renderPrompt('figma-polish', VARS);
+    expect(out).toContain('不要去追像素比例');
   });
 
   it('不存在的角色必須報錯', () => {

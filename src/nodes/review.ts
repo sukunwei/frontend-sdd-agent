@@ -14,13 +14,19 @@ import type { GateAnswer } from './answers.js';
 import { readDeveloperReport, taskSection } from './tdd.js';
 
 /**
- * The reviews of the TDD loop.
+ * The review of the TDD loop.
  *
- * Two reviewers look at the work of the developer: the **spec reviewer**
- * asks whether the task was done ("實作了嗎？"), the **quality reviewer**
- * asks whether it was done well ("寫得好嗎？"). v1 has no third reviewer -
- * the correctness and security checklist of the old code reviewer lives in
- * the quality reviewer.
+ * One reviewer looks at the work of the developer and answers two
+ * questions: whether the task was done ("實作了嗎？" - the `spec` verdict)
+ * and whether it was done well ("寫得好嗎？" - the `quality` verdict). The
+ * correctness and security checklist lives in the quality half.
+ *
+ * **One work order, two verdicts.** The reviewer used to be two work
+ * orders - the spec reviewer and the quality reviewer - and every task paid
+ * for three round trips (developer, spec review, quality review). The
+ * second round trip bought little: the same reader, the same files, the
+ * same diff. Now one order asks both questions, and the two verdicts come
+ * back together.
  *
  * **A review is a JSON document, not a sentence.** The worker answers with
  * the `ReviewResult` of the protocol, and the graph reads the verdict from
@@ -62,7 +68,10 @@ export const REJECTION_LIMIT = 2;
  * must be reported as an invalid review (the order goes out again), not as
  * an invalid result (the whole result is thrown away).
  */
-const LooseWorkerResultSchema = WorkerResultSchema.extend({ review: z.unknown().optional() });
+const LooseWorkerResultSchema = WorkerResultSchema.extend({
+  review: z.unknown().optional(),
+  reviews: z.unknown().optional(),
+});
 
 /** The verdict of a completed work order. */
 export interface CompletionCheck {
@@ -166,11 +175,12 @@ export function validateCompletion(
   }
 
   if (workOrder.resultSchema === 'review') {
-    const review = ReviewResultSchema.safeParse(parsed.data.review);
-    const role = reviewRoleOf(workOrder.role);
-    // A review order always names its reviewer: an order that does not is
-    // not a review order, and a review of the wrong role is no review.
-    if (!review.success || role === undefined || review.data.role !== role) {
+    // **The combined reviewer has to answer both questions.** A review that
+    // only says whether the task was done, or only whether it was done
+    // well, is half a review - and the half that is missing is exactly the
+    // half nobody would have noticed.
+    const roles = reviewRoles(parsed.data.reviews, parsed.data.review);
+    if (!roles.has('spec') || !roles.has('quality')) {
       return { ok: false, reason: 'invalid_review', countsAsFailure: invalidCount >= 1 };
     }
   }
@@ -190,25 +200,19 @@ export function validateCompletion(
  *
  * @param state - The graph state (`repoPath`, `requirementName`).
  * @param task - The task that was worked.
- * @param role - Which reviewer the session has to play.
  */
-export function reviewWorkOrder(
-  state: GraphState,
-  task: Task,
-  role: 'spec' | 'quality'
-): WorkOrder {
+export function reviewWorkOrder(state: GraphState, task: Task): WorkOrder {
   const repoDir = state.repoPath;
   const docsDir = getDocsDir(state.requirementName, repoDir);
   const inputs = [path.join(docsDir, 'tasks.md'), path.join(docsDir, 'spec.md')];
-  const body = renderWorkOrder(role === 'spec' ? 'spec-reviewer' : 'quality-reviewer', {
+  const body = renderWorkOrder('reviewer', {
     goal:
-      role === 'spec'
-        ? '審查這次實作有沒有做到 task 的驗收條件。'
-        : '審查這次實作寫得好不好、而且是不是對的。',
+      '審查這次實作：做到 task 的驗收條件了嗎（spec），而且寫得好、又是對的嗎（quality）。',
     cwd: repoDir,
     inputs,
     outputs: [],
-    outputFormat: '不寫任何檔案：只回報一段 ReviewResult JSON（格式見下方「完成時」）。',
+    outputFormat:
+      '不寫任何檔案：只回報兩段 ReviewResult JSON（spec 與 quality，格式見下方「完成時」）。',
   });
 
   const sections = [body, taskSection(task)];
@@ -219,7 +223,7 @@ export function reviewWorkOrder(
 
   return {
     audience: 'host',
-    role: role === 'spec' ? 'spec_reviewer' : 'quality_reviewer',
+    role: 'reviewer',
     prompt: `${sections.join('\n\n')}\n`,
     cwd: repoDir,
     inputs,
@@ -232,10 +236,9 @@ export function reviewWorkOrder(
  * What the reviewer has to know about the work it reviews.
  *
  * Two things: what the developer reported (its summary and the files it
- * wrote) and the review that came before (the history of the task - for the
- * quality reviewer that is the verdict of the spec reviewer).
+ * wrote) and the reviews that came before (the history of the task).
  *
- * @param state - The graph state (`lastReview` and the ledger of the loop).
+ * @param state - The graph state (`lastReviews` and the ledger of the loop).
  */
 function reviewContext(state: GraphState): string {
   const sections: string[] = [];
@@ -255,15 +258,17 @@ function reviewContext(state: GraphState): string {
     sections.push(lines.join('\n'));
   }
 
-  const previous = state.lastReview;
-  if (previous) {
+  const previous = state.lastReviews ?? [];
+  if (previous.length > 0) {
     const lines = ['## 之前的評審（這個 task 的歷史）'];
-    lines.push('');
-    lines.push(`- 角色：${previous.role}`);
-    lines.push(`- 結論：${previous.verdict}`);
-    for (const issue of previous.issues) {
-      const where = issue.line === undefined ? issue.file : `${issue.file}:${issue.line}`;
-      lines.push(`- [${issue.severity}] ${where} —— ${issue.message}`);
+    for (const review of previous) {
+      lines.push('');
+      lines.push(`- 角色：${review.role}`);
+      lines.push(`- 結論：${review.verdict}`);
+      for (const issue of review.issues) {
+        const where = issue.line === undefined ? issue.file : `${issue.file}:${issue.line}`;
+        lines.push(`- [${issue.severity}] ${where} —— ${issue.message}`);
+      }
     }
     sections.push(lines.join('\n'));
   }
@@ -473,8 +478,24 @@ function countOf(state: GraphState, step: string): number {
  * `undefined` means the order is not a review order at all - a review order
  * that does not name a reviewer cannot be checked against a review.
  */
-function reviewRoleOf(role: string | undefined): 'spec' | 'quality' | undefined {
-  if (role === 'spec_reviewer') return 'spec';
-  if (role === 'quality_reviewer') return 'quality';
-  return undefined;
+/**
+ * The roles a review answer covers.
+ *
+ * The answer may carry the reviews in `reviews` (the combined reviewer) or
+ * in `review` (a worker that only did one of them).
+ *
+ * @param reviews - The `reviews` field of the answer.
+ * @param review - The `review` field of the answer.
+ * @returns The roles that are covered.
+ */
+export function reviewRoles(reviews: unknown, review: unknown): Set<string> {
+  const roles = new Set<string>();
+  const list = Array.isArray(reviews) ? reviews : [];
+  for (const item of list) {
+    const parsed = ReviewResultSchema.safeParse(item);
+    if (parsed.success) roles.add(parsed.data.role);
+  }
+  const single = ReviewResultSchema.safeParse(review);
+  if (single.success) roles.add(single.data.role);
+  return roles;
 }

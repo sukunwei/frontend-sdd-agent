@@ -16,16 +16,10 @@ describe('workflow-state 1.1.0', () => {
     expect(parsed.success).toBe(true);
   });
 
-  it('複雜度不得是 L', () => {
-    const bad = { version: '1.1.0', currentStage: 'taskSplit', tasks: [{ id: 'TASK-x', title: 'x', acceptanceCriteria: [], acRefs: [], complexity: 'L', priority: 'high' }] };
-    const parsed = WorkflowStateSchema.safeParse(bad);
-    expect(parsed.success).toBe(false);
-    // 必須是因為複雜度被拒，而不是因為文件缺了別的欄位
-    if (!parsed.success) {
-      expect(parsed.error.issues.map((issue) => issue.path.map(String).join('.'))).toContain(
-        'tasks.0.complexity'
-      );
-    }
+  it('複雜度可以是 L：一個跨檔案但仍是單一行為的 task', () => {
+    const doc = { version: '1.1.0', currentStage: 'taskSplit', tasks: [{ id: 'TASK-x', title: 'x', acceptanceCriteria: ['a'], acRefs: ['AC-001'], complexity: 'L', priority: 'high' }] };
+    const parsed = WorkflowStateSchema.safeParse(doc);
+    expect(parsed.success).toBe(true);
   });
 
   it('其他版本不得被接受（鏡像格式只有 1.1.0）', () => {
@@ -48,7 +42,7 @@ describe('workflow-state 1.1.0', () => {
     expect(parsed.approvals).toEqual({});
     expect(parsed.currentTaskIndex).toBe(0);
     expect(parsed.tddSubStage).toBe('pending');
-    expect(parsed.lastReview).toBeNull();
+    expect(parsed.lastReviews).toEqual([]);
     expect(parsed.tddAttempts).toBe(0);
     expect(parsed.verification.checks).toEqual([]);
     expect(parsed.bootstrapped).toBe(false);

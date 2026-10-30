@@ -130,7 +130,7 @@ describe('TDD 子圖', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'page.tsx'), 'export default function Page() { return null; }\n');
     writeFileSync(join(dir, 'page.module.css'), '.page {}\n');
-    const test = join(repoDir, 'src', '__tests__', 'setup-qrcode-page-route.test.tsx');
+    const test = join(repoDir, 'src', '__tests__', 'setup-qrcode-page-route.test.ts');
     mkdirSync(join(test, '..'), { recursive: true });
     writeFileSync(test, "it('renders', () => {});\n");
   }
@@ -151,7 +151,7 @@ describe('TDD 子圖', () => {
       // The test file of the task is part of the scope: the developer
       // prompt demands the TDD flow, and the scope rule says the worker
       // only writes the paths of `outputs`.
-      join(repoDir, 'src/__tests__/setup-qrcode-page-route.test.tsx'),
+      join(repoDir, 'src/__tests__/setup-qrcode-page-route.test.ts'),
     ]);
   });
 
@@ -163,7 +163,7 @@ describe('TDD 子圖', () => {
     const tests = payload.outputs.filter((file: string) => /__tests__|\.test\.|\.spec\./.test(file));
     expect(tests.length).toBeGreaterThan(0);
     // 工作單裡也說得出來那個測試檔是哪一個
-    expect(payload.prompt).toContain('src/__tests__/setup-qrcode-page-route.test.tsx');
+    expect(payload.prompt).toContain('src/__tests__/setup-qrcode-page-route.test.ts');
   });
 
   it('developer 工作單之前必須先打上 start 標籤', async () => {
@@ -174,30 +174,62 @@ describe('TDD 子圖', () => {
     expect(tags).toContain('sdd/task/TASK-setup-qrcode-page-route/start');
   });
 
-  it('developer 完成後依序是 spec 評審與 quality 評審', async () => {
-    const { g, cfg } = tddGraph([TASK_A]);
+  it('developer 完成後是一張審查工作單（spec 與 quality 一起審）', async () => {
+    const { g, cfg, verifyRuns } = tddGraph([TASK_A]);
     await g.invoke({ requirementName: 'demo' }, cfg);
 
     developerFiles();
     await g.invoke(new Command({ resume: { status: 'ok', summary: 'done', changedFiles: [] } }), cfg);
-    const spec = await pending(g, cfg);
-    expect(spec.role).toBe('spec_reviewer');
-    expect(spec.resultSchema).toBe('review');
+    const review = await pending(g, cfg);
+    expect(review.role).toBe('reviewer');
+    expect(review.resultSchema).toBe('review');
 
+    // 一張單問兩個問題：兩個結論一起回來。
     await g.invoke(
       new Command({
         resume: {
           status: 'ok',
           summary: '',
           changedFiles: [],
-          review: { role: 'spec', verdict: 'pass', issues: [] },
+          reviews: [
+            { role: 'spec', verdict: 'pass', issues: [] },
+            { role: 'quality', verdict: 'pass', issues: [] },
+          ],
         },
       }),
       cfg
     );
-    const quality = await pending(g, cfg);
-    expect(quality.role).toBe('quality_reviewer');
-    expect(quality.resultSchema).toBe('review');
+    // 審查通過 → 這個 task 完成 → 交棒給驗證階段（不再有審查工作單）
+    expect(verifyRuns.count).toBe(1);
+  });
+
+  it('舊的 checkpoint（spec_review_done）不能讓 run 卡死：合併審查還是要跑', async () => {
+    // 舊版本的子階段值：規格審查已經過了，下一步是品質審查。現在兩者合併，
+    // 所以它要落到「開發者做完了，該審查了」—— 不是掉進沒有 case 的縫裡。
+    const g = buildGraph({
+      checkpointer: createCheckpointer(join(dir, 'cp.sqlite')),
+      testNodes: {
+        bootstrap: async (): Promise<NodeOutcome> => ({
+          kind: 'advance',
+          update: {
+            bootstrapped: true,
+            currentStage: 'tdd',
+            requirementName: 'demo',
+            repoPath: repoDir,
+            tasks: [TASK_A],
+            currentTaskIndex: 0,
+            tddSubStage: 'spec_review_done' as any,
+          },
+          goto: 'tdd',
+        }),
+      },
+    });
+    const cfg = { configurable: { thread_id: 'thr-legacy-substage' } };
+
+    await g.invoke({ requirementName: 'demo' }, cfg);
+
+    const payload = await pending(g, cfg);
+    expect(payload.role).toBe('reviewer');
   });
 
   it('task 串行：一個 task 走完才輪到下一個', async () => {
@@ -211,18 +243,10 @@ describe('TDD 子圖', () => {
           status: 'ok',
           summary: '',
           changedFiles: [],
-          review: { role: 'spec', verdict: 'pass', issues: [] },
-        },
-      }),
-      cfg
-    );
-    await g.invoke(
-      new Command({
-        resume: {
-          status: 'ok',
-          summary: '',
-          changedFiles: [],
-          review: { role: 'quality', verdict: 'pass', issues: [] },
+          reviews: [
+            { role: 'spec', verdict: 'pass', issues: [] },
+            { role: 'quality', verdict: 'pass', issues: [] },
+          ],
         },
       }),
       cfg
@@ -247,18 +271,10 @@ describe('TDD 子圖', () => {
           status: 'ok',
           summary: '',
           changedFiles: [],
-          review: { role: 'spec', verdict: 'pass', issues: [] },
-        },
-      }),
-      cfg
-    );
-    await g.invoke(
-      new Command({
-        resume: {
-          status: 'ok',
-          summary: '',
-          changedFiles: [],
-          review: { role: 'quality', verdict: 'pass', issues: [] },
+          reviews: [
+            { role: 'spec', verdict: 'pass', issues: [] },
+            { role: 'quality', verdict: 'pass', issues: [] },
+          ],
         },
       }),
       cfg
@@ -402,7 +418,7 @@ describe('評審工作單的脈絡', () => {
         changedFiles: ['/repo/src/app/page/qrcode-app/page.tsx'],
       }),
     };
-    const order = reviewWorkOrder(withReport, TASK_A, 'spec');
+    const order = reviewWorkOrder(withReport, TASK_A);
     expect(order.prompt).toContain('這次實作的回報');
     expect(order.prompt).toContain('加了頁面骨架與測試');
     expect(order.prompt).toContain('page.tsx');

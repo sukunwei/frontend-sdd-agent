@@ -12,10 +12,42 @@ import { parseE2eRows, parseTasks } from '../src/parsers/ids.js';
 
 const FIX = path.join(import.meta.dirname, 'fixtures', 'qrcode-app');
 
+
+/**
+ * A `tasks.md` with one task of the given complexity and acceptance criteria.
+ */
+function tasksMd(complexity: string, criteria: number): string {
+  const acs = Array.from({ length: criteria }, (_, i) => `- 條件 ${i + 1}`).join('\n');
+  return [
+    '# Tasks: demo',
+    '',
+    '## Task List',
+    '',
+    '| Task ID | Title | Complexity | Priority | AC Refs |',
+    '|---------|-------|------------|----------|---------|',
+    `| TASK-huge-thing | Huge thing | ${complexity} | high | AC-001 |`,
+    '',
+    '## Task Details',
+    '',
+    '### TASK-huge-thing: Huge thing',
+    '',
+    '**Description**: 一個行為。',
+    '',
+    '**Acceptance Criteria**:',
+    acs,
+    '',
+    '**AC Refs**: AC-001',
+    '',
+    '**Files**:',
+    '- `src/thing.ts`',
+    '',
+  ].join('\n');
+}
+
 describe('TaskSplit 出口', () => {
-  it('不得出現 L 複雜度', () => {
+  it('範例計畫裡不得有不合法的 L 級 task', () => {
     const r = taskSplitNode.exit({} as any, FIX);
-    expect(r.hasComplexL).toBe(false);
+    expect(r.invalidComplexTasks).toEqual([]);
   });
 
   it('TASK id 不得重複', () => {
@@ -33,22 +65,28 @@ describe('TaskSplit 出口', () => {
     expect(r.slugDrift).toEqual([]);
   });
 
-  it('L 級任務不得進入狀態', () => {
+  it('L 級 task 有三條以上驗收條件時可以通過', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-tasks-l-'));
     try {
       fs.copyFileSync(path.join(FIX, 'spec.md'), path.join(dir, 'spec.md'));
-      fs.writeFileSync(
-        path.join(dir, 'tasks.md'),
-        [
-          '| Task ID | Title | Complexity | Priority | AC Refs |',
-          '|---------|-------|------------|----------|---------|',
-          '| TASK-huge-thing | Huge thing | L | high | AC-001 |',
-          '',
-        ].join('\n'),
-        'utf-8'
-      );
+      fs.writeFileSync(path.join(dir, 'tasks.md'), tasksMd('L', 3), 'utf-8');
       const r = taskSplitNode.exit({} as any, dir);
-      expect(r.hasComplexL).toBe(true);
+      expect(r.invalidComplexTasks).toEqual([]);
+      expect(r.ok).toBe(true);
+      expect(r.tasks.map((task) => task.complexity)).toEqual(['L']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('L 級 task 只有一兩條驗收條件時被退件（那是還沒拆開的 M）', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-tasks-l-'));
+    try {
+      fs.copyFileSync(path.join(FIX, 'spec.md'), path.join(dir, 'spec.md'));
+      fs.writeFileSync(path.join(dir, 'tasks.md'), tasksMd('L', 2), 'utf-8');
+      const r = taskSplitNode.exit({} as any, dir);
+      expect(r.invalidComplexTasks).toEqual(['TASK-huge-thing']);
+      expect(r.ok).toBe(false);
       expect(r.tasks).toEqual([]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -244,7 +282,7 @@ describe('TaskSplit 節點', () => {
     expect(payload.inputs).toContain(path.join(docsDir, 'e2e-plan.csv'));
   });
 
-  it('有 L 級任務時再發一次，並在 prompt 裡要求拆到 S/M', async () => {
+  it('L 級 task 看起來不像單一行為時再發一次，並在 prompt 裡說清楚規則', async () => {
     const { g, cfg } = splitGraph();
     await g.invoke({ requirementName: 'demo' }, cfg);
     fs.writeFileSync(
@@ -261,7 +299,8 @@ describe('TaskSplit 節點', () => {
 
     const payload = await pending(g, cfg);
     expect(payload.role).toBe('task_splitter');
-    expect(payload.prompt).toMatch(/S\/M/);
+    // L 本身不是問題：不夠多驗收條件才是。
+    expect(payload.prompt).toMatch(/at least 3 acceptance criteria/);
   });
 
   it('第二次還是有 L 級任務時必須問使用者', async () => {

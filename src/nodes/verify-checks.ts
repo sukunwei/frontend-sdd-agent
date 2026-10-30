@@ -7,9 +7,18 @@ import type { VerificationCheck } from '../state/types.js';
 /**
  * The four deterministic gates of the verification stage.
  *
- * The order is fixed (`lint:ts` → `lint` → `test` → `e2e`): a gate that
- * fails stops the ones behind it, because a type error makes the test
- * result meaningless and a failing test makes the e2e run meaningless.
+ * The order is fixed (`lint:ts` → `lint` → `test` → `e2e`).
+ *
+ * **The first two stop the pass when they fail**: a type error makes the
+ * result of the other gates meaningless, and `eslint --fix` rewrites the
+ * source code, so nothing may read it at the same time.
+ *
+ * **The last two run at the same time** (see `runGates`): they do not
+ * rewrite the source code, and the e2e run is the slow one.
+ *
+ * The two of them still share the machine: a repository whose jest
+ * `globalSetup` and whose Playwright `webServer` want the same port will
+ * fail the e2e run for a reason that has nothing to do with the code.
  *
  * **Only `lint` carries `--fix`.** The other three gates report, they do not
  * repair: `tsc --noEmit` cannot write anything, and a test or an e2e run

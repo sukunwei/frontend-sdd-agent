@@ -353,16 +353,16 @@ describe('端對端：真實的 CLI 走完一輪', () => {
     // 範圍裡有實作檔，也要有這個 task 的測試檔（TDD 的第一步）
     expect(payload.outputs).toEqual([
       path.join(repoDir, 'src', 'greeting.ts'),
-      path.join(repoDir, 'src', '__tests__', 'add-greeting.test.tsx'),
+      path.join(repoDir, 'src', '__tests__', 'add-greeting.test.ts'),
     ]);
   });
 
-  it('14. 宿主把程式碼寫出來，complete 之後圖發出規格審查工作單', async () => {
+  it('14. 宿主把程式碼寫出來，complete 之後圖發出審查工作單', async () => {
     const source = path.join(repoDir, 'src', 'greeting.ts');
     fs.mkdirSync(path.dirname(source), { recursive: true });
     fs.writeFileSync(source, 'export const greeting = (name: string) => `Hello, ${name}`;\n', 'utf-8');
     // 測試檔也要真的寫出來：工作單的輸出清單裡有它
-    const testFile = path.join(repoDir, 'src', '__tests__', 'add-greeting.test.tsx');
+    const testFile = path.join(repoDir, 'src', '__tests__', 'add-greeting.test.ts');
     fs.mkdirSync(path.dirname(testFile), { recursive: true });
     fs.writeFileSync(testFile, "it('greets', () => {});\n", 'utf-8');
 
@@ -372,10 +372,10 @@ describe('端對端：真實的 CLI 走完一輪', () => {
     expect(r.out?.threadId).toBe(TASK);
     expect(r.out?.audience).toBe('host');
     const payload = r.out?.payload as { role: string };
-    expect(payload.role).toBe('spec_reviewer');
+    expect(payload.role).toBe('reviewer');
   });
 
-  it('15. complete：規格審查通過，圖發出品質審查工作單', async () => {
+  it('15. complete：審查通過（spec 與 quality 一起），四道關卡過了，圖走到 completed', async () => {
     const r = await cli([
       'complete',
       '--task',
@@ -383,30 +383,12 @@ describe('端對端：真實的 CLI 走完一輪', () => {
       '--result',
       JSON.stringify({
         status: 'ok',
-        summary: '規格都做到了',
+        summary: '規格都做到了，而且寫得好',
         changedFiles: [],
-        review: { role: 'spec', verdict: 'pass', issues: [] },
-      }),
-    ]);
-
-    expect(r.rc).toBe(2);
-    expect(r.out?.threadId).toBe(TASK);
-    expect(r.out?.audience).toBe('host');
-    const payload = r.out?.payload as { role: string };
-    expect(payload.role).toBe('quality_reviewer');
-  });
-
-  it('16. complete：品質審查通過，四道關卡過了，圖走到 completed', async () => {
-    const r = await cli([
-      'complete',
-      '--task',
-      TASK,
-      '--result',
-      JSON.stringify({
-        status: 'ok',
-        summary: '寫得好而且是對的',
-        changedFiles: [],
-        review: { role: 'quality', verdict: 'pass', issues: [] },
+        reviews: [
+          { role: 'spec', verdict: 'pass', issues: [] },
+          { role: 'quality', verdict: 'pass', issues: [] },
+        ],
       }),
     ]);
 

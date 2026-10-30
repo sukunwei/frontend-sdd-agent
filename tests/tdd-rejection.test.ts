@@ -96,7 +96,7 @@ describe('CLI 的駁回要交給圖（Ruling 24）', () => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'page.tsx'), 'export default function Page() { return null; }\n');
     fs.writeFileSync(path.join(dir, 'page.module.css'), '.page {}\n');
-    const test = path.join(repoDir, 'src', '__tests__', 'setup-qrcode-page-route.test.tsx');
+    const test = path.join(repoDir, 'src', '__tests__', 'setup-qrcode-page-route.test.ts');
     fs.mkdirSync(path.dirname(test), { recursive: true });
     fs.writeFileSync(test, 'it("works", () => {});\n');
   }
@@ -118,7 +118,7 @@ describe('CLI 的駁回要交給圖（Ruling 24）', () => {
       )
     ).toBe(2);
     const review = JSON.parse(io.take().out);
-    expect(review.payload.role).toBe('spec_reviewer');
+    expect(review.payload.role).toBe('reviewer');
 
     // 3. 評審不是合法的 ReviewResult → 同一張單重發，階段不動
     expect(
@@ -128,7 +128,7 @@ describe('CLI 的駁回要交給圖（Ruling 24）', () => {
     expect(again.kind).toBe('interrupt');
     expect(again.audience).toBe('host');
     expect(again.stage).toBe('tdd');
-    expect(again.payload.role).toBe('spec_reviewer');
+    expect(again.payload.role).toBe('reviewer');
     // 同一張單：payload 一模一樣
     expect(again.payload).toEqual(review.payload);
 
