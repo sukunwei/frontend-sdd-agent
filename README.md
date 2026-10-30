@@ -11,6 +11,7 @@
 - [目標專案要準備什麼](#目標專案要準備什麼)
 - [七個階段](#七個階段)
 - [`/sdd-graph:*` 指令](#sdd-graph-指令)
+- [`collect_prd`：一次問完三件事](#collect_prd一次問完三件事)
 - [CLI 合約](#cli-合約)
 - [Interrupt 類型](#interrupt-類型)
 - [檔案落在哪裡](#檔案落在哪裡)
@@ -152,7 +153,9 @@ claude plugin list | grep -A 4 sdd-graph
 
 1. 圖在**外掛的工作區**裡 clone 那個 repo（`<外掛目錄>/workspace/tasks/my-feature/repo`），
    開一條 `task/my-feature` 分支，並且**拿住全域的分支鎖**。
-2. 圖停在 `collect_prd`，把 PRD 的問題**問你**（需求是使用者給的，不是模型編的）。
+2. 圖停在 `collect_prd`，**一次問你三件事**：PRD（路徑或文字）、設計（Figma 連結或
+   文字描述）、其他文件（選填）。需求是使用者給的，不是模型編的。細節見
+   [`collect_prd`：一次問完三件事](#collect_prd一次問完三件事)。
 3. 你回答 → 圖進 `spec` → 發一張 `spec_writer` 工作單給會話 → 會話寫出
    `discovery.md` + `spec.md`（含驗收條件 `AC-001`…）→ 圖解析、追問、確認。
 4. `e2ePlan` → `taskSplit` → `tdd`（每個 task 一輪：實作 → 規格審查 → 品質審查）
@@ -163,7 +166,8 @@ claude plugin list | grep -A 4 sdd-graph
 ### 步驟 5 — 一輪下來會留下什麼
 
 - **在你原本的 repo 裡**：`task/my-feature` 分支上有 `docs/my-feature/` 底下的
-  `prd.md`、`discovery.md`、`spec.md`、`e2e-plan.csv`、`tasks.md`、
+  `prd.md`、`design.md`（有文字描述的設計時）、`refs/*`（有其他文件時）、
+  `discovery.md`、`spec.md`、`e2e-plan.csv`、`tasks.md`、
   `workflow-state.json`、`verify/*.log`，以及實作出来的程式碼與測試。
   這些會被 commit 在那條分支上（`git push` 失敗不影響流程，只是分支留在本地）。
 - **在外掛目錄裡**：`workspace/tasks/my-feature/`（clone 與 metadata）、
@@ -199,12 +203,74 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 | 階段 | 誰執行 | 產出 | 閘口 |
 |---|---|---|---|
 | `bootstrap` | 確定性（圖內） | workspace、分支鎖、clone、run-metadata | 鎖衝突／舊 run 要 resume 還是 reset |
-| `prd` | **先問人** | `prd.md` | `collect_prd` →（有 Figma URL 才）`figma_fetch` → `confirm_prd` |
-| `spec` | 工作單 | `discovery.md` + `spec.md` | `figma_missing`、澄清最多 3 輪、blocking TBC 未解不得離開、`confirm_spec` |
+| `prd` | **先問人** | `prd.md`、`design.md`、`refs/*` | `collect_prd` →（有 Figma URL 才）`figma_fetch` → `confirm_prd` |
+| `spec` | 工作單 | `discovery.md` + `spec.md` | 澄清最多 3 輪、blocking TBC 未解不得離開、`confirm_spec` |
 | `e2ePlan` | 工作單 | `e2e-plan.csv` | `confirm_e2e` |
 | `taskSplit` | 工作單 | `tasks.md` | 不得有 `L`、id 不得重複、id 要由標題派生、`confirm_tasks` |
 | `tdd` | 工作單 × N（開發者 → 規格審查 → 品質審查） | 程式碼、測試、評審 JSON | 失敗兩次 rollback、第三次問使用者 |
 | `verification` | 確定性（圖內） | 四道關卡的結果 | `lint:ts` → `lint` → `test` → `e2e`，失敗要使用者決定 |
+
+### 流程圖
+
+> 下面的圖是 [mermaid](https://mermaid.js.org/) —— GitHub 會直接渲染。用純文字看
+> README 的話，表格與程式碼區塊說的是同一件事。
+
+```mermaid
+flowchart TD
+  START(["start"]) --> BOOT
+
+  BOOT["<b>bootstrap</b> · 確定性<br/>工作區・全域分支鎖・clone 專案"]
+  BOOT --> PRD
+
+  PRD["<b>prd</b> · 先問人<br/>需求由使用者給，不是模型編的"]
+  PRD --> PRD_Q{{"<b>collect_prd</b><br/>把 PRD 問使用者"}}
+  PRD_Q --> PRD_C{{"<b>confirm_prd</b><br/>使用者確認 PRD"}}
+  PRD_C -.->|"不確認"| PRD_Q
+  PRD_C --> SPEC
+
+  SPEC["<b>spec</b> · 工作單<br/>spec_writer → discovery.md + spec.md"]
+  SPEC --> SPEC_Q{{"<b>spec_questions</b> / <b>tbc_blocking</b><br/>澄清・待確認項"}}
+  SPEC_Q -.->|"還有未解的"| SPEC
+  SPEC_Q --> SPEC_C{{"<b>confirm_spec</b><br/>使用者確認規格"}}
+  SPEC_C -.->|"退回"| SPEC
+  SPEC_C --> E2E
+
+  E2E["<b>e2ePlan</b> · 工作單<br/>e2e_planner → e2e-plan.csv"]
+  E2E --> E2E_C{{"<b>confirm_e2e</b>"}}
+  E2E_C -.->|"退回"| E2E
+  E2E_C --> TS
+
+  TS["<b>taskSplit</b> · 工作單<br/>task_splitter → tasks.md<br/>不得有 L 複雜度・id 不得重複"]
+  TS --> TS_C{{"<b>confirm_tasks</b>"}}
+  TS_C -.->|"退回"| TS
+  TS_C --> TDD
+
+  TDD["<b>tdd</b> · 工作單 × N<br/>developer → spec_reviewer → quality_reviewer"]
+  TDD --> VER
+
+  VER["<b>verification</b> · 確定性<br/>lint:ts → lint → test → e2e"]
+  VER --> VER_Q{{"<b>verify_failed</b><br/>使用者決定怎麼辦"}}
+  VER_Q -.->|"manual：回去修"| TDD
+  VER_Q -.->|"skip / abort"| DONE
+  VER --> DONE(["<b>completed</b>"])
+
+  classDef gate fill:#fff4e5,stroke:#e8a33d,stroke-width:2px
+  classDef work fill:#e8f0fe,stroke:#4a7de8,stroke-width:2px
+  classDef det fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
+  classDef term fill:#f3e8fd,stroke:#8e5bd0,stroke-width:2px
+
+  class PRD,PRD_Q,PRD_C,SPEC_Q,SPEC_C,E2E_C,TS_C,VER_Q gate
+  class SPEC,E2E,TS,TDD work
+  class BOOT,VER det
+  class START,DONE term
+```
+
+| 顏色 | 意思 |
+|---|---|
+| 橘 | 使用者閘口 —— 要人決定 |
+| 藍 | 工作單 —— 會話用本會話的工具做 |
+| 綠 | 圖內確定性 —— 圖自己算完 |
+| 紫 | 起訖 |
 
 `prd` 階段是**先問人**的：需求是使用者給的，不是模型編的。
 每一段的需求文件都寫在 repo 裡（`docs/<requirement>/`），跟程式碼一起被 commit。
@@ -213,6 +279,48 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 `spec_reviewer`（有沒有做到驗收條件）→ `quality_reviewer`（品質過不過關）。
 評審不通過就回到 developer。連續失敗會 `rollback`（回到這個 task 起的 git 標籤），
 第三次才會問使用者。
+
+### TDD 的一輪
+
+```mermaid
+flowchart TD
+  DEV["<b>developer</b> 工作單<br/>寫實作 + 測試<br/>outputs 必須真的在磁碟上"]
+  DEV --> REV1
+
+  REV1{"<b>spec_reviewer</b><br/>有沒有做到驗收條件？"}
+  REV1 -->|pass| REV2
+  REV1 -->|fail| LAD
+
+  REV2{"<b>quality_reviewer</b><br/>品質過不過關？"}
+  REV2 -->|pass| NEXT(["下一個 task"])
+  REV2 -->|fail| LAD
+
+  LAD["<b>升級階梯</b><br/>計數住在圖的 state 裡<br/>觸發：評審 fail・單沒交付・結果不是合法 JSON"]
+  LAD --> A1{"第 1 次失敗"}
+  A1 -->|"再給一次機會"| DEV
+  A1 -->|"再失敗"| A2{"第 2 次失敗"}
+  A2 -->|"再失敗"| A3{"第 3 次失敗"}
+
+  A2 --> RB["<b>rollback</b><br/>git reset 回這個 task 起的標籤"]
+  RB --> RBQ{{"<b>tdd_rollback</b><br/>使用者決定：wait / skip / abort"}}
+
+  A3 --> BLQ{{"<b>tdd_blocked</b><br/>使用者決定：wait / skip / abort"}}
+
+  RBQ -.->|"wait：再跑一次"| DEV
+  RBQ -.->|"skip / abort：收掉這個 task"| DONE(["<b>completed</b>"])
+  BLQ -.->|"wait：再跑一次"| DEV
+  BLQ -.->|"skip：放棄這個 task"| DONE
+
+  classDef gate fill:#fff4e5,stroke:#e8a33d,stroke-width:2px
+  classDef work fill:#e8f0fe,stroke:#4a7de8,stroke-width:2px
+  classDef det fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
+  classDef term fill:#f3e8fd,stroke:#8e5bd0,stroke-width:2px
+
+  class REV1,REV2,A1,A2,A3,RBQ,BLQ gate
+  class DEV work
+  class RB det
+  class LAD,NEXT,DONE term
+```
 
 ---
 
@@ -244,6 +352,44 @@ LOOP:
 
 ---
 
+## `collect_prd`：一次問完三件事
+
+`/sdd-graph:start` 之後，圖停的第一個閘門就是 `collect_prd`。它一次問三件事：
+
+1. **PRD** —— 文件路徑，或文字描述
+2. **Figma** —— 設計檔連結，或用文字描述設計；沒有設計就說沒有
+3. **其他文件** —— 選填，規格階段要一起讀的
+
+閘門的 payload 帶著 `question`（那三個問題）與 `answer`（答案的形狀）：
+
+```jsonc
+{
+  "prd":   "<markdown>" | { "path": "/absolute/path/to/PRD.md" },
+  "figma": "<figma url>" | { "url": "https://..." } | { "text": "<the design, in words>" } | null,
+  "docs":  [ { "path": "/absolute/path/to/other.md" } | { "name": "other.md", "text": "..." } ]
+}
+```
+
+**路徑由圖自己去讀**，內容原封不動寫進 `docs/<task>/`：
+
+| 你給的 | 落在 |
+|---|---|
+| PRD（路徑或文字） | `docs/<task>/prd.md` |
+| Figma **連結** | `docs/<task>/figma/*`（宿主用 Figma MCP 抓的 P0 資源） |
+| Figma **文字描述** | `docs/<task>/design.md` |
+| 其他文件 | `docs/<task>/refs/<檔名>` |
+
+- **讀不到路徑不會弄死那一輪。** 閘門帶著診斷（`note`）再問一次，告訴你是哪個路徑出問題。
+- **答應的形狀不對會出錯**（`throw`），不會無聲地再問一次 —— 那是宿主的 bug，要吵。
+- 舊的形狀 `{ "prdMarkdown": "...", "figmaUrl": "..." }` 照樣認得。
+
+**設計只問一次。** 閘門記下你的決定（`url` / `text` / `none`），spec 階段**不會**再問第二次
+—— 只有「你給了 Figma 連結、但 P0 抓不到」時才會再問（那時要決定：重抓、記成 TBC、還是略過）。
+
+**`confirm_prd` 會告訴你圖到底收了什麼**（來源路徑、位元組數、其他檔案），你看得見再批准。
+
+---
+
 ## CLI 合約
 
 ```bash
@@ -264,6 +410,42 @@ sdd-graph change   --task <n>
 | `2` | 有待處理的中斷 | `{"kind":"interrupt","audience":...,"type":...,"threadId":...,"stage":...,"payload":...}` | - |
 | `1` | 參數錯、沒有這個 thread、違反 audience 合約 | - | `{"kind":"error","code":...,"message":...}` |
 
+宿主（Claude Code 會話）拿到退出碼之後做的事：
+
+```mermaid
+flowchart TD
+  LOOP["sdd-graph start / resume"] --> RC{"退出碼"}
+
+  RC -->|"0"| FIN(["回報：這一輪完成"])
+  RC -->|"1"| ERR(["讀 stderr<br/>kind: error ・ code: ..."])
+
+  RC -->|"2 有待處理的中斷"| ENV["讀 stdout 的 JSON 信封<br/>kind: interrupt ・ audience ・ type ・ payload"]
+
+  ENV --> AUD{"audience"}
+
+  AUD -->|"user"| ASK["把 payload 的 question / options<br/>問使用者"]
+  ASK --> AP["sdd-graph approve --payload '...'"]
+
+  AUD -->|"host"| WORK["照 payload.role 與 payload.prompt<br/>用本會話的工具完成 payload.outputs"]
+  WORK --> CP["sdd-graph complete --result '...'"]
+
+  AP --> LOOP
+  CP --> LOOP
+
+  MIS["<b>走錯會被擋下來</b><br/>approve 答 host 的單 → audience_mismatch<br/>complete 答 user 的閘口 → audience_mismatch"]
+  AP -.-> MIS
+  CP -.-> MIS
+
+  classDef ok fill:#eaf7ea,stroke:#4caf50,stroke-width:2px
+  classDef gate fill:#fff4e5,stroke:#e8a33d,stroke-width:2px
+  classDef work fill:#e8f0fe,stroke:#4a7de8,stroke-width:2px
+  classDef bad fill:#fde8e8,stroke:#d04a4a,stroke-width:2px
+
+  class RC,AUD gate
+  class ENV,ASK work
+  class LOOP,FIN,ERR,AP,CP ok
+  class MIS bad
+```
 stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audience_mismatch`、
 `invalid_result`、`invalid_payload`、`invalid_order`、`already_completed`、
 `lock_not_owned`、`not_implemented`、`internal_error`。
@@ -288,8 +470,8 @@ stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audie
 | `already_exists` | user | `start` 撞到舊 run | `{ action: 'resume' \| 'reset' }` |
 | `lock_conflict` | user | bootstrap | `{ action: 'wait' \| 'stop_other' }` |
 | `bootstrap_failed` | user | 複製連續失敗 | `{ code, message }` |
-| `collect_prd` | user | prd 入口 | `{ prdMarkdown, figmaUrl? }` |
-| `figma_missing` | user | spec 入口，設計資源不在 | `{ action: 'fetch' \| 'tbc' \| 'skip' }` |
+| `collect_prd` | user | prd 入口 | `{ prd, figma, docs }` —— 見下 |
+| `figma_missing` | user | 給了 Figma 連結但抓不到檔案 | `{ action: 'fetch' \| 'tbc' \| 'skip' }` |
 | `figma_needs_human` | user | Figma 那一班的工人卡住了，要使用者決定 | `{ question, options }` |
 | `work_order`（role=`figma_fetch`） | host | 使用者給了 Figma URL | `WorkerResult` |
 | `work_order`（role=spec_writer 等） | host | 寫作／實作／評審 | `WorkerResult` |
@@ -325,7 +507,9 @@ stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audie
 ├── workspace/tasks/<task>/
 │   ├── repo/                     ← clone 出來的專案（會被 commit 的都在這裡）
 │   │   ├── docs/<task>/          ← 需求文件（跟程式碼一起被 commit）
-│   │   │   ├── prd.md
+│   │   │   ├── prd.md             ← 使用者的需求（路徑或文字，原封不動）
+│   │   │   ├── design.md          ← 使用者用文字描述的設計（有的話）
+│   │   │   ├── refs/*             ← 使用者給的其他文件（有的話）
 │   │   │   ├── discovery.md
 │   │   │   ├── spec.md           ← 含 AC-001…（規格的關卡）
 │   │   │   ├── e2e-plan.csv

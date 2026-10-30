@@ -183,32 +183,26 @@ describe('端對端：真實的 CLI 走完一輪', () => {
     expect(fs.readFileSync(path.join(docsDir, 'prd.md'), 'utf-8')).toContain('# PRD');
   });
 
-  it('3. approve：使用者確認 PRD，圖進 spec 階段並問設計資源', async () => {
+  it('3. approve：使用者確認 PRD，圖進 spec 階段並直接發 spec_writer 工作單', async () => {
     const r = await cli(['approve', '--task', TASK, '--payload', JSON.stringify({ approved: true })]);
 
     expect(r.rc).toBe(2);
     expect(r.out?.threadId).toBe(TASK);
-    expect(r.out?.audience).toBe('user');
-    expect(r.out?.type).toBe('figma_missing');
-    expect(r.out?.stage).toBe('spec');
-
-    // The mirror follows the run.
-    expect(readMirror().currentStage).toBe('spec');
-  });
-
-  it('4. approve：使用者說不用 Figma，圖發出 spec_writer 工作單', async () => {
-    const r = await cli(['approve', '--task', TASK, '--payload', JSON.stringify({ action: 'skip' })]);
-
-    expect(r.rc).toBe(2);
-    expect(r.out?.threadId).toBe(TASK);
+    // 使用者在 collect_prd 就說過「沒有 Figma」了：spec 階段不得再問第二次。
     expect(r.out?.audience).toBe('host');
     expect(r.out?.type).toBe('work_order');
-    const payload = r.out?.payload as { role: string; outputs: string[] };
+    expect(r.out?.stage).toBe('spec');
+
+    const payload = r.out?.payload as { role: string; outputs: string[]; inputs: string[] };
     expect(payload.role).toBe('spec_writer');
     expect(payload.outputs).toEqual([
       path.join(docsDir, 'discovery.md'),
       path.join(docsDir, 'spec.md'),
     ]);
+    expect(payload.inputs).toContain(path.join(docsDir, 'prd.md'));
+
+    // The mirror follows the run.
+    expect(readMirror().currentStage).toBe('spec');
   });
 
   it('5. 硬案例：拿 approve 去答一張 host 的單，必須回 1 audience_mismatch', async () => {
@@ -595,40 +589,23 @@ describe('端對端：真的 spawn bin/sdd-graph（行程層級）', () => {
   );
 
   it(
-    '3. approve：確認 PRD 之後圖問設計資源',
+    '3. approve：確認 PRD 之後圖直接發 spec_writer 工作單（設計問過了就不再問）',
     () => {
       const r = bin(['approve', '--task', CHILD_TASK, '--payload', JSON.stringify({ approved: true })]);
 
       expect(r.rc).toBe(2);
-      expect(r.out?.audience).toBe('user');
-      expect(r.out?.type).toBe('figma_missing');
-      expect(r.out?.stage).toBe('spec');
-      expect(r.out?.threadId).toBe(CHILD_TASK);
-    },
-    120_000
-  );
-
-  it(
-    '4. approve：不用 Figma，圖發出 spec_writer 工作單',
-    () => {
-      const r = bin([
-        'approve',
-        '--task',
-        CHILD_TASK,
-        '--payload',
-        JSON.stringify({ action: 'skip' }),
-      ]);
-
-      expect(r.rc).toBe(2);
       expect(r.out?.audience).toBe('host');
       expect(r.out?.type).toBe('work_order');
+      expect(r.out?.stage).toBe('spec');
       expect(r.out?.threadId).toBe(CHILD_TASK);
-      const payload = r.out?.payload as { role: string; outputs: string[] };
+
+      const payload = r.out?.payload as { role: string; outputs: string[]; inputs: string[] };
       expect(payload.role).toBe('spec_writer');
       expect(payload.outputs).toEqual([
         path.join(docsDir(), 'discovery.md'),
         path.join(docsDir(), 'spec.md'),
       ]);
+      expect(payload.inputs).toContain(path.join(docsDir(), 'prd.md'));
     },
     120_000
   );
