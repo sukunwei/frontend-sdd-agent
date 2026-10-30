@@ -23,15 +23,14 @@
 
 ```
 1. 讀 CLAUDE.md            → 了解專案慣例
-2. 讀 tasks.md             → 找到這張工作單指派的 task
-3. 讀 spec.md              → 了解完整脈絡與邊界條件
-4. 讀 Figma P0 素材        → UI task 先鎖定視覺真值來源
-5. TEST LIST 階段          → 寫任何程式碼之前，先列出所有測試
-6. RED 階段                → 逐個寫會失敗的測試
-7. GREEN 階段              → 寫最少量的實作讓測試通過
-8. 回歸檢查                → 跑完整測試套件，修掉任何 breakage
-9. REFACTOR 階段           → 整理，跑測試確認仍然是綠的
-10. 回報證據
+2. 讀 spec.md              → 了解完整脈絡與邊界條件
+3. 讀這個 task 的視覺真值   → UI task：工作單的「必讀輸入」裡有原型頁與截圖
+4. TEST LIST 階段          → 寫任何程式碼之前，先列出所有測試
+5. RED 階段                → 逐個寫會失敗的測試
+6. GREEN 階段              → 寫最少量的實作讓測試通過
+7. 回歸檢查                → 跑完整測試套件，修掉任何 breakage
+8. REFACTOR 階段           → 整理，跑測試確認仍然是綠的
+9. 回報證據
 ```
 
 ## 硬性規則
@@ -46,21 +45,25 @@
 - **UI 真值來源**：UI task 的樣式只能以本地的 Figma P0 素材為準，不准「猜」。**視覺以 HTML 原型為準、截圖為輔** —— 截圖只能說「長這樣」，HTML 原型能說「這裡是 8px 間距、這是 `var(--color-primary)`、這是三欄 grid」。
 - **不寫 Raw 樣式值**：優先用 design token；不要為了省事引入 spec/token 沒有 justify 的 hex/px。
 
-### UI 相關 task 要讀的 Figma P0 素材
+### UI 相關 task 的視覺真值
 
-- `docs/<requirement>/figma/design-tree.json`
-- `docs/<requirement>/figma/design-tokens.json`
-- `docs/<requirement>/figma/design-context.md`
-- `docs/<requirement>/figma/screenshots/*.png`
-- `docs/<requirement>/figma/figma-meta.json`
-- `docs/<requirement>/figma/prototype/index.html` —— **視覺真值**：每一個 frame 一頁 HTML
-- `docs/<requirement>/figma/prototype/<frameKey>.html` —— 這個 task 對應的那一頁
-- `docs/<requirement>/figma/prototype/css/tokens.css` —— design token 已經是 CSS 變數了
+工作單的「必讀輸入」已經把這個 task 需要的東西給你了：
 
-**上面這三個原型檔案只有「有 Figma 設計」時才會存在**（這個需求給了 Figma 連結，
-而且抓取成功）。沒有就沒有原型：這時以 design-tree 與 design token 為準。
+- `figma/prototype/<frameKey>.html` —— **視覺真值**：這個 task 實作的那一頁
+- `figma/screenshots/<frameKey>.png` —— 同一個 frame 的 Figma 截圖
+- `figma/prototype/css/tokens.css` —— design token 已經是 CSS 變數了
 
-任何一份必要的 P0 素材缺少，都要明確回報，並在動手寫視覺細節之前先提出 TBC。
+**不要去讀整個 Figma 檔。** 整個設計檔的節點樹（`figma/design-tree.json`）、原始的
+design token（`figma/design-tokens.json`）、還有別的 frame 的截圖，都不在你的工作單裡 ——
+**原型頁就是它們的提煉版**，讀原型就夠了。
+
+只有在需要互動細節（hover、disabled、錯誤狀態）的時候，才去讀
+`figma/design-context.md` 的那一段。
+
+這三個原型檔案只有「有 Figma 設計」時才會存在（這個需求給了 Figma 連結，而且抓取成功）。
+沒有就沒有原型：這時以 spec 的設計說明為準。
+
+任何一份必要的素材缺少，都要明確回報，並在動手寫視覺細節之前先提出 TBC。
 
 **有原型的話，它已經跟 Figma 截圖量過一次了**（見 `docs/<requirement>/figma/diff/report.md`）。你在實作時**不必**再跑一次像素比對 —— 照著原型做出來就對了；你只負責把原型裡的樣式翻成這個專案的寫法。
 

@@ -136,6 +136,13 @@ describe('工作單正文', () => {
     expect(out).not.toContain('三次來回');
   });
 
+  it('developer 的工作單不再把整個 Figma 檔列成必讀（原型取代了它）', () => {
+    const out = renderPrompt('developer', VARS);
+    expect(out).not.toMatch(/^- `docs\/<requirement>\/figma\/design-tree\.json`/m);
+    expect(out).not.toMatch(/^- `docs\/<requirement>\/figma\/screenshots\/\*\.png`/m);
+    expect(out).not.toMatch(/^- `docs\/<requirement>\/figma\/design-tokens\.json`/m);
+  });
+
   it('developer 的工作單要說明原型只有「有 Figma 設計」時才有', () => {
     const out = renderPrompt('developer', VARS);
     expect(out).toContain('有 Figma 設計');

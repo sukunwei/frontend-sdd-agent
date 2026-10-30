@@ -11,6 +11,7 @@ import { ReviewResultSchema } from '../state/schema.js';
 import type { Task } from '../state/types.js';
 import { readAnswer } from './answers.js';
 import type { GateAnswer } from './answers.js';
+import { reviewerInputs } from './context.js';
 import { readDeveloperReport, taskSection } from './tdd.js';
 
 /**
@@ -204,7 +205,7 @@ export function validateCompletion(
 export function reviewWorkOrder(state: GraphState, task: Task): WorkOrder {
   const repoDir = state.repoPath;
   const docsDir = getDocsDir(state.requirementName, repoDir);
-  const inputs = [path.join(docsDir, 'tasks.md'), path.join(docsDir, 'spec.md')];
+  const inputs = reviewerInputs(docsDir, task);
   const body = renderWorkOrder('reviewer', {
     goal:
       '審查這次實作：做到 task 的驗收條件了嗎（spec），而且寫得好、又是對的嗎（quality）。',

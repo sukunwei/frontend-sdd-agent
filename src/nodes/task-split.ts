@@ -348,7 +348,8 @@ export function taskSplitWorkOrder(
     outputs,
     outputFormat:
       'Markdown：先一個 task 表（Task ID / Title / Complexity / Priority / AC Refs），' +
-      '再每個 task 一個明細區塊（Description、Acceptance Criteria、AC Refs、Files）。',
+      '再每個 task 一個明細區塊（Description、Acceptance Criteria、AC Refs、Files、Frames）。' +
+      'Frames 是這個 task 實作的 Figma frame（frameKey，逗號分隔）；沒有畫面的 task 省略這一行。',
   });
   const prompt = note === undefined ? body : `${body}\n\n## What the last attempt got wrong\n\n${note}\n`;
 
@@ -384,6 +385,7 @@ function toStateTask(task: ParsedTask): Task {
     ...(task.description !== undefined ? { description: task.description } : {}),
     acceptanceCriteria: task.acceptanceCriteria,
     acRefs: task.acRefs,
+    frames: task.frames,
     complexity: task.complexity,
     priority: task.priority,
   };

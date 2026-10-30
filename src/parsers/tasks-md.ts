@@ -63,6 +63,9 @@ const ACCEPTANCE_MARKER_PATTERN = /^\*\*Acceptance Criteria\*\*:\s*(.*)$/;
 /** `**AC Refs**: AC-001, AC-002` */
 const AC_REFS_MARKER_PATTERN = /^\*\*AC Refs\*\*:\s*(.*)$/;
 
+/** `**Frames**: 1-23, 2-10` - the Figma frames this task implements. */
+const FRAMES_MARKER_PATTERN = /^\*\*Frames\*\*:\s*(.*)$/;
+
 /** Any other `**Marker**: value` line, used to stop a description. */
 const ANY_MARKER_PATTERN = /^\*\*[^*]+\*\*\s*:/;
 
@@ -153,15 +156,17 @@ function findDetailBlocks(lines: string[]): Map<string, DetailBlock> {
   return blocks;
 }
 
-/** Read the description, the acceptance criteria and the AC refs of a block. */
+/** Read the description, the acceptance criteria, the AC refs and the frames of a block. */
 function readDetailBlock(lines: string[]): {
   description?: string;
   acceptanceCriteria: string[];
   acRefs: string[];
+  frames: string[];
 } {
   let description: string | undefined;
   const acceptanceCriteria: string[] = [];
   const acRefs: string[] = [];
+  const frames: string[] = [];
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -215,9 +220,18 @@ function readDetailBlock(lines: string[]): {
       }
       continue;
     }
+
+    const framesMatch = FRAMES_MARKER_PATTERN.exec(line);
+    if (framesMatch) {
+      for (const frame of framesMatch[1].split(',')) {
+        const key = frame.trim();
+        if (key !== '' && !frames.includes(key)) frames.push(key);
+      }
+      continue;
+    }
   }
 
-  return { description, acceptanceCriteria, acRefs };
+  return { description, acceptanceCriteria, acRefs, frames };
 }
 
 /** Read the complexity cell; the wide type keeps `L` visible to the gate. */
@@ -339,7 +353,10 @@ export function parseTasks(tasksMd: string): ParsedTask[] {
       description?: string;
       acceptanceCriteria: string[];
       acRefs: string[];
-    } = block ? readDetailBlock(block.lines) : { acceptanceCriteria: [], acRefs: [] };
+      frames: string[];
+    } = block
+      ? readDetailBlock(block.lines)
+      : { acceptanceCriteria: [], acRefs: [], frames: [] };
 
     const acRefs: string[] = [];
     if (acRefsColumn >= 0) {
@@ -354,6 +371,7 @@ export function parseTasks(tasksMd: string): ParsedTask[] {
       title,
       acceptanceCriteria: detail.acceptanceCriteria,
       acRefs,
+      frames: detail.frames,
       complexity: readComplexity(row[complexityColumn]),
       priority: readPriority(row[priorityColumn]),
     };

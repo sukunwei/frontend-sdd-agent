@@ -47,6 +47,8 @@
 
 **Files**:
 - `src/app/page/qrcode-app/page.tsx`
+
+**Frames**: 1-23
 ```
 
 ## 硬性規則（圖會照這幾條擋你）
@@ -58,6 +60,18 @@
 5. **Task ID 不得重複。**
 6. **Priority** 只能是 `high`、`medium` 或 `low`。
 7. **task 數**：整份計畫的 task 數約等於 `ceil(AC 數 / 4)`，最多 **8 個**。超過 8 個不是「需求大」，是拆太細。
+8. **每個有畫面的 task 要寫 `**Frames**:`** —— 這個 task 實作的 Figma frame（frameKey，多個用逗號分隔，例如 `1-23, 2-10`）。**純邏輯 task（沒有畫面）省略這一行。**
+
+   frameKey 在 `docs/<需求>/figma/prototype/index.html` 與 `docs/<需求>/figma/screenshots/` 裡 —— 先讀那兩個地方才知道有哪些 frame、它們長什麼樣。**只寫這個 task 真的實作的那個畫面**，不要把整份設計的 frame 都塞進來。
+
+   這一行決定了實作者讀到什麼：開發者拿到的是這個 frame 的原型頁與截圖，不是整個 Figma 檔。寫錯了，開發者會拿著錯的視覺真值寫程式碼。
+
+## 讀什麼
+
+- `docs/<requirement>/spec.md` —— 需求與驗收條件
+- `docs/<requirement>/figma/prototype/index.html` —— **有哪些 frame**（這個需求有 Figma 設計時才有）
+- `docs/<requirement>/figma/prototype/<frameKey>.html` —— 每個 frame 的樣子（拿來對照 task 切在哪裡）
+- `docs/<requirement>/figma/screenshots/<frameKey>.png` —— 每個 frame 的截圖
 
 ## 拆分原則
 

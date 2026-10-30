@@ -6,6 +6,7 @@ import type { GraphState } from '../graph/state.js';
 import { readStageStep, recordStageStep } from '../graph/state.js';
 import { renderWorkOrder } from '../prompts/loader.js';
 import { getDocsDir } from '../runtime/paths.js';
+import { developerInputs } from './context.js';
 import type { ReviewResult, Task } from '../state/types.js';
 import { readAnswer } from './answers.js';
 
@@ -115,7 +116,10 @@ export function developerWorkOrder(state: GraphState, task: Task): WorkOrder {
     role: 'developer',
     prompt: developerPrompt(state, task, scope),
     cwd: repoDir,
-    inputs: [path.join(docsDir, 'tasks.md'), path.join(docsDir, 'spec.md')],
+    // **The inputs are small on purpose.** The task itself is in the
+    // prompt, and the design comes from the prototype of the frames this
+    // task implements - not from the whole design file.
+    inputs: developerInputs(docsDir, task),
     outputs: scope.outputs,
     resultSchema: 'none',
   };
@@ -139,10 +143,10 @@ export function developerPrompt(state: GraphState, task: Task, scope: TaskScope)
     renderWorkOrder('developer', {
       goal: `實作 task ${task.id}（${task.title}），用嚴格的 TDD 流程：先寫測試，再寫實作，最後整理。`,
       cwd: repoDir,
-      inputs: [path.join(docsDir, 'tasks.md'), path.join(docsDir, 'spec.md')],
+      inputs: developerInputs(docsDir, task),
       outputs: scope.outputs,
       outputFormat:
-        '專案慣例的原始碼與測試檔（見 tasks.md 這個 task 的 Files 清單），' +
+        '專案慣例的原始碼與測試檔（見這個 task 的 Files 清單），' +
         '外加下面「Developer Output」的回報格式。',
     }),
   ];

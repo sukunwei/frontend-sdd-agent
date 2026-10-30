@@ -31,6 +31,8 @@ export interface ParsedTask {
   title: string;
   description?: string;
   acceptanceCriteria: string[];
+  /** The Figma frames this task implements (`**Frames**:` in tasks.md). */
+  frames: string[];
   acRefs: string[];
   complexity: ParsedComplexity;
   priority: 'high' | 'medium' | 'low';

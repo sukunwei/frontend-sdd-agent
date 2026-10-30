@@ -121,6 +121,46 @@ describe('tasks.md 解析', () => {
     expect(setup?.description).toBeTruthy();
   });
 
+  it('task 的 **Frames** 會被讀出來（frameKey，逗號分隔）', () => {
+    const md = [
+      '| Task ID | Title | Complexity | Priority | AC Refs |',
+      '|---------|-------|------------|----------|---------|',
+      '| TASK-do-thing | Do thing | S | high | AC-001 |',
+      '',
+      '### TASK-do-thing: Do thing',
+      '',
+      '**Description**: 做出一個畫面。',
+      '',
+      '**Acceptance Criteria**:',
+      '- 看得到畫面',
+      '',
+      '**AC Refs**: AC-001',
+      '',
+      '**Frames**: 1-23, 2-10',
+      '',
+    ].join('\n');
+    expect(parseTasks(md)[0].frames).toEqual(['1-23', '2-10']);
+  });
+
+  it('沒有 **Frames** 的 task 解析出來是空的（純邏輯 task）', () => {
+    const md = [
+      '| Task ID | Title | Complexity | Priority | AC Refs |',
+      '|---------|-------|------------|----------|---------|',
+      '| TASK-do-thing | Do thing | S | high | AC-001 |',
+      '',
+      '### TASK-do-thing: Do thing',
+      '',
+      '**Description**: 做一件事。',
+      '',
+      '**Acceptance Criteria**:',
+      '- 做得到',
+      '',
+      '**AC Refs**: AC-001',
+      '',
+    ].join('\n');
+    expect(parseTasks(md)[0].frames).toEqual([]);
+  });
+
   it('tasks.md 出現 L 複雜度時解析器看得見（由關卡決定是否放行）', () => {
     const md = [
       '| Task ID | Title | Complexity | Priority |',

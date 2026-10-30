@@ -75,6 +75,7 @@ export const TaskSchema: z.ZodType<Task> = z.object({
   title: z.string(),
   description: z.string().optional(),
   acceptanceCriteria: z.array(z.string()),
+  frames: z.array(z.string()).optional(),
   acRefs: z.array(z.string()),
   complexity: ComplexitySchema,
   priority: z.enum(PRIORITIES),

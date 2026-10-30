@@ -33,8 +33,8 @@
 
 ```
 1. 讀 CLAUDE.md          → 了解專案慣例
-2. 讀 tasks.md           → 找到這張工作單指派的 task
-3. 讀 spec.md 與 Figma P0 素材（UI task 才需要）
+2. 讀 spec.md            → 了解需求與邊界條件
+3. 讀這個 task 的原型頁   → UI task：視覺真值在工作單的「必讀輸入」裡
 4. 讀實作檔案
 5. 讀測試檔案
 6. 跑檢查（tsc / eslint）
