@@ -533,6 +533,24 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
 工作單的正文在 `prompts/<role>.md`（模板），由 `src/prompts/loader.ts` 填入
 目標、工作目錄、必讀輸入、必交輸出與產出格式。
 
+### 實作者拿到的是「剛好夠」的東西
+
+`developer` 與 `reviewer` 工作單的**必讀輸入很小**：
+
+| 輸入 | 內容 |
+|---|---|
+| `spec.md` | 需求與邊界條件（整份） |
+| `figma/prototype/<frameKey>.html` | **這個 task 實作的那一頁原型**（視覺真值） |
+| `figma/screenshots/<frameKey>.png` | 同一個 frame 的 Figma 截圖 |
+| `figma/prototype/css/tokens.css` | design token 已經是 CSS 變數了 |
+
+`tasks.md` **不在輸入裡** —— 這個 task 的 id、描述、驗收條件、檔案清單本來就在工作單
+的提示詞裡。整個 Figma 檔（`design-tree.json`、原始 token、全部 frame 的截圖）也不在：
+**原型頁就是它們的提煉版**。
+
+「這個 task 對應哪個 frame」是 `tasks.md` 裡 task 區塊的 `**Frames**:` 一行決定的
+（沒有畫面的 task 省略這行）。
+
 ---
 
 ## 檔案落在哪裡

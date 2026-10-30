@@ -144,7 +144,9 @@ describe('TDD 子圖', () => {
     expect(payload.type).toBe('work_order');
     expect(payload.role).toBe('developer');
     expect(payload.cwd).toBe(repoDir);
-    expect(payload.inputs).toEqual([join(docsDir, 'tasks.md'), join(docsDir, 'spec.md')]);
+    // **The inputs are slim**: the task is in the prompt, and there is no
+    // Figma design in this fixture, so the specification is all there is.
+    expect(payload.inputs).toEqual([join(docsDir, 'spec.md')]);
     expect(payload.outputs).toEqual([
       join(repoDir, 'src/app/page/qrcode-app/page.tsx'),
       join(repoDir, 'src/app/page/qrcode-app/page.module.css'),
@@ -408,6 +410,54 @@ describe('評審工作單的脈絡', () => {
     repoPath: repoDir,
     requirementName: 'demo',
     stageSteps: {},
+  });
+
+  describe('工作單的 context 要瘦', () => {
+    /** The prototype of one frame, on disk. */
+    function writePrototype(key = '1-23'): void {
+      const prototypeDir = join(docsDir, 'figma', 'prototype');
+      mkdirSync(join(prototypeDir, 'css'), { recursive: true });
+      mkdirSync(join(docsDir, 'figma', 'screenshots'), { recursive: true });
+      writeFileSync(join(prototypeDir, `${key}.html`), '<html></html>');
+      writeFileSync(join(prototypeDir, 'css', 'tokens.css'), ':root {}');
+      writeFileSync(join(docsDir, 'figma', 'screenshots', `${key}.png`), 'x');
+    }
+
+    it('developer 的 inputs 只有 spec、這個 task 的原型頁與截圖、tokens.css', () => {
+      writePrototype();
+      const order = developerWorkOrder(state(), { ...TASK_A, frames: ['1-23'] });
+      expect(order.inputs).toEqual([
+        join(docsDir, 'spec.md'),
+        join(docsDir, 'figma', 'prototype', '1-23.html'),
+        join(docsDir, 'figma', 'screenshots', '1-23.png'),
+        join(docsDir, 'figma', 'prototype', 'css', 'tokens.css'),
+      ]);
+    });
+
+    it('developer 的 inputs 不再包含整份 tasks.md（task 已經在提示詞裡）', () => {
+      writePrototype();
+      const order = developerWorkOrder(state(), { ...TASK_A, frames: ['1-23'] });
+      expect(order.inputs).not.toContain(join(docsDir, 'tasks.md'));
+    });
+
+    it('沒有 Figma 設計時 inputs 只剩 spec.md', () => {
+      const order = developerWorkOrder(state(), TASK_A);
+      expect(order.inputs).toEqual([join(docsDir, 'spec.md')]);
+    });
+
+    it('frame 不存在時不給那條路徑（會話不該拿到找不到的檔案）', () => {
+      const order = developerWorkOrder(state(), { ...TASK_A, frames: ['9-99'] });
+      expect(order.inputs).toEqual([join(docsDir, 'spec.md')]);
+    });
+
+    it('審查工作單也要瘦：spec 加上這個 task 的原型頁', () => {
+      writePrototype();
+      const order = reviewWorkOrder(state(), { ...TASK_A, frames: ['1-23'] });
+      expect(order.inputs).toEqual([
+        join(docsDir, 'spec.md'),
+        join(docsDir, 'figma', 'prototype', '1-23.html'),
+      ]);
+    });
   });
 
   it('評審工作單要說得出來開發者做了什麼', () => {

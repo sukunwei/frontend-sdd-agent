@@ -93,6 +93,38 @@ describe('TaskSplit 出口', () => {
     }
   });
 
+  it('task 的 frame 對應會進到狀態裡（開發者才知道要看哪一頁原型）', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-tasks-frames-'));
+    try {
+      fs.copyFileSync(path.join(FIX, 'spec.md'), path.join(dir, 'spec.md'));
+      fs.writeFileSync(
+        path.join(dir, 'tasks.md'),
+        [
+          '| Task ID | Title | Complexity | Priority | AC Refs |',
+          '|---------|-------|------------|----------|---------|',
+          '| TASK-setup-qrcode-page-route | Setup QR code page route | S | high | AC-001 |',
+          '',
+          '### TASK-setup-qrcode-page-route: Setup QR code page route',
+          '',
+          '**Description**: 建立頁面。',
+          '',
+          '**Acceptance Criteria**:',
+          '- 路由存在',
+          '',
+          '**AC Refs**: AC-001',
+          '',
+          '**Frames**: 1-23',
+          '',
+        ].join('\n'),
+        'utf-8'
+      );
+      const r = taskSplitNode.exit({} as any, dir);
+      expect(r.tasks[0].frames).toEqual(['1-23']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('重複的 task id 必須被報出來', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-tasks-dup-'));
     try {

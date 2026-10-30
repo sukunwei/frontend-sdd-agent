@@ -44,6 +44,16 @@ export interface Task {
   title: string;
   description?: string;
   acceptanceCriteria: string[];
+  /**
+   * The Figma frames this task implements.
+   *
+   * The keys are the frame keys of the prototype (`1-23`), and they are what
+   * the work order hands the worker: the page of that frame, its screenshot
+   * and the design tokens - **not** the whole design file.
+   *
+   * Empty for a task that has no screen (a pure logic task).
+   */
+  frames?: string[];
   acRefs: string[];
   complexity: Complexity;
   priority: 'high' | 'medium' | 'low';
