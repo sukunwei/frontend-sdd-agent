@@ -7,6 +7,8 @@ import {
   isWorktreeDirty,
   currentBranchName,
   prepareLocalBranch,
+  GIT_READ_TIMEOUT_MS,
+  GIT_WRITE_TIMEOUT_MS,
 } from '../src/runtime/git-branch-manager.js';
 
 /**
@@ -148,6 +150,23 @@ describe('本地分支準備', () => {
     expect(r.error).toBeTruthy();
   });
 
+  it('查不到工作區狀態時 dirty 不是 false（false 會被讀成「乾淨」）', () => {
+    const notRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-local-notrepo2-'));
+    extraDirs.push(notRepo);
+    const r = prepareLocalBranch(notRepo, 'task/x');
+    expect(r.ok).toBe(false);
+    // 「不知道」跟「乾淨」要分得開
+    expect(r.dirty).toBeUndefined();
+  });
+
+  it('checkout 用獨立且明顯較長的逾時（不能被砍在半路）', () => {
+    // 寫操作被砍半會留下「索引已更新、檔案沒寫完」的半完成狀態，
+    // 那是在使用者真實的倉庫上動手，代價太高。
+    expect(GIT_READ_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
+    expect(GIT_WRITE_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    expect(GIT_WRITE_TIMEOUT_MS).toBeGreaterThan(GIT_READ_TIMEOUT_MS);
+  });
+
   it('currentBranchName 在沒有 commit 的空倉庫回傳 HEAD', () => {
     const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-local-empty-'));
     extraDirs.push(empty);
@@ -157,5 +176,15 @@ describe('本地分支準備', () => {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     expect(currentBranchName(empty)).toBe('HEAD');
+  });
+
+  it('detached HEAD → 回傳 HEAD，代表「不在任何分支上」而不是一個分支名', () => {
+    const sha = git(['rev-parse', 'HEAD']).trim();
+    git(['checkout', sha]);
+    // 'HEAD' 不是分支名：呼叫端不能把它當成分支寫進 run-metadata。
+    expect(currentBranchName(dir)).toBe('HEAD');
+    // 真的在分支上時回真正的分支名
+    git(['checkout', 'main']);
+    expect(currentBranchName(dir)).toBe('main');
   });
 });

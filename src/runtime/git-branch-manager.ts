@@ -170,25 +170,59 @@ export interface LocalBranchResult {
   branch: string;
   /** 切換前的當前分支。 */
   currentBranch: string;
-  /** 工作區是否有已跟蹤文件的改動（未跟蹤文件不算）。 */
-  dirty: boolean;
+  /**
+   * 工作區是否有已跟蹤文件的改動（未跟蹤文件不算）。
+   *
+   * `undefined` = **無法判斷**（例如不是 git 倉庫、git 失敗），
+   * 不是「乾淨」——不知道就說不知道，別寫成 false 讓人誤以為可以放心往下走。
+   */
+  dirty: boolean | undefined;
   error?: string;
   errorCode?: ErrorCode;
 }
 
-/** 就地模式的 git 操作都是本地的，逾時給短一點，失敗時不用等太久。 */
-const LOCAL_GIT_TIMEOUT_MS = 10_000;
+/**
+ * 只讀 git 命令（status / rev-parse）的逾時。
+ *
+ * 這些命令只是看狀態，不該把使用者卡住；大倉庫的 `git status` 偶爾慢，
+ * 給 10 秒夠用又不會變成無限期等待。
+ */
+export const GIT_READ_TIMEOUT_MS = 10_000;
 
 /**
- * 跑就地模式 git 命令的共用選項。
+ * 寫入型 git 命令（checkout）的逾時。
+ *
+ * **寫操作不能用只讀的短逾時**：`execFileSync` 逾時會把 git 砍掉（SIGTERM），
+ * 切大分支時可能在「索引已更新、檔案還沒寫完」的中途被砍，
+ * 留下一堆要 `git checkout .` 才能收拾的半完成狀態——
+ * 那是在使用者真實的倉庫上動手，砍半的代價太高。
+ */
+export const GIT_WRITE_TIMEOUT_MS = 120_000;
+
+/**
+ * 跑只讀 git 命令的選項。
  *
  * argv 陣列、不經過 shell（分支名裡的 `;` 只是分支名的一部分）；
  * `LC_ALL=C` 讓 git 的錯誤訊息到處都一樣，錯誤訊息才能被拿來判斷原因。
  */
-function localGitOptions(): ExecFileSyncOptionsWithStringEncoding {
+function localReadOptions(): ExecFileSyncOptionsWithStringEncoding {
   return {
     encoding: 'utf-8',
-    timeout: LOCAL_GIT_TIMEOUT_MS,
+    timeout: GIT_READ_TIMEOUT_MS,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, LC_ALL: 'C' },
+  };
+}
+
+/**
+ * 跑寫入型 git 命令的選項（只有 checkout 走這條）。
+ *
+ * 逾時比只讀命令長，理由見 {@link GIT_WRITE_TIMEOUT_MS}。
+ */
+function localWriteOptions(): ExecFileSyncOptionsWithStringEncoding {
+  return {
+    encoding: 'utf-8',
+    timeout: GIT_WRITE_TIMEOUT_MS,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, LC_ALL: 'C' },
   };
@@ -212,6 +246,27 @@ function gitErrorText(err: unknown): string {
 }
 
 /**
+ * 這次失敗是逾時造成的嗎？
+ *
+ * `execFileSync` 逾時會把 git 砍掉（SIGTERM），例外上帶 `code: 'ETIMEDOUT'`、
+ * `status: null`、`signal: 'SIGTERM'`；git 自己拒絕時則是 `status` 有數字。
+ * **逾時與 git 自己的拒絕要分得開**：逾時代表「命令沒跑完」——
+ * 對寫操作來說還可能留下半完成的狀態，與「git 拒絕了這件事」完全不同，
+ * 使用者要能一眼看出是哪一種。
+ */
+function isTimeoutError(err: unknown): boolean {
+  if (!(err instanceof Error)) {
+    return false;
+  }
+  const e = err as Error & {
+    code?: unknown;
+    status?: number | null;
+    signal?: string | null;
+  };
+  return e.code === 'ETIMEDOUT' || (e.status === null && e.signal === 'SIGTERM');
+}
+
+/**
  * 判斷工作區是否「髒」。
  *
  * **口徑只看已跟蹤文件的修改**：`git status --porcelain --untracked-files=no`。
@@ -232,7 +287,7 @@ export function isWorktreeDirty(repoRoot: string): boolean {
   const out = execFileSync(
     'git',
     ['-C', repoRoot, 'status', '--porcelain', '--untracked-files=no'],
-    localGitOptions()
+    localReadOptions()
   );
   return out.trim() !== '';
 }
@@ -240,23 +295,34 @@ export function isWorktreeDirty(repoRoot: string): boolean {
 /**
  * 取得目前所在的分支名。
  *
- * 空倉庫（還沒有任何 commit）時 git 會失敗，此時回 `HEAD`——
- * 呼叫端要的是一個可以寫進 run-metadata 的字串，不是 undefined。
+ * **回傳 `'HEAD'` 代表「目前不在任何分支上」，它不是一個分支名。**
+ * 兩種情況都會得到 `'HEAD'`：
+ * - detached HEAD（checkout 到某個 commit，沒有分支指向它）——
+ *   `git rev-parse --abbrev-ref HEAD` 會印出字面的 `HEAD`，這裡明確地把它當成「沒有分支」；
+ * - 倉庫還沒有任何提交（沒有分支可站）——rev-parse 會直接失敗。
+ *
+ * 兩種情況都不回「那個還沒生出來的分支名」：
+ * 呼叫端（例如寫 run-metadata）要的是一個真的存在的分支，
+ * 拿到一個不存在的分支名，比拿到明確的 `'HEAD'` 更糟。
  *
  * @param repoRoot - git 倉庫根目錄
- * @returns 分支名；取不到時為 `'HEAD'`
+ * @returns 分支名；**不在任何分支上**（或不是 git 倉庫）時為 `'HEAD'`
  */
 export function currentBranchName(repoRoot: string): string {
   try {
     const out = execFileSync(
       'git',
       ['-C', repoRoot, 'rev-parse', '--abbrev-ref', 'HEAD'],
-      localGitOptions()
+      localReadOptions()
     );
     const name = out.trim();
-    return name === '' ? 'HEAD' : name;
+    // detached HEAD 時 git 印出的就是字面的 'HEAD'——那不是分支名。
+    if (name === '' || name === 'HEAD') {
+      return 'HEAD';
+    }
+    return name;
   } catch {
-    // 空倉庫（還沒有任何 commit）git 會失敗；此時用 HEAD 代表「沒有分支」。
+    // 空倉庫（還沒有任何提交）或不是 git 倉庫：沒有「目前所在的分支」可言。
     return 'HEAD';
   }
 }
@@ -272,7 +338,7 @@ function localBranchExists(repoRoot: string, branchName: string): boolean {
     execFileSync(
       'git',
       ['-C', repoRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${branchName}`],
-      localGitOptions()
+      localReadOptions()
     );
     return true;
   } catch {
@@ -296,6 +362,11 @@ function localBranchExists(repoRoot: string, branchName: string): boolean {
  * 不用 `stash`、不用 `reset --hard`。git 失敗時把它的原始訊息帶出來，
  * 使用者才知道是分支被別的 worktree 佔用，還是別的問題。
  *
+ * **回傳值的三種失敗語意**（靠 `ok` + `dirty` 一起看）：
+ * - `ok:false` + `dirty:true` → 工作區髒，需要使用者決定（呼叫端開閘門）；
+ * - `ok:false` + `dirty:undefined` → 連工作區狀態都查不到（不是 git 倉庫、git 失敗）；
+ * - `ok:false` + `dirty:false` → 真的 git 失敗（checkout 被拒絕或逾時）。
+ *
  * @param repoRoot - 使用者業務倉庫的根目錄
  * @param branchName - 目標分支名
  * @param opts - `skipSwitch: true` 表示不切分支，就在此刻的分支上工作
@@ -316,8 +387,11 @@ export function prepareLocalBranch(
       ok: false,
       branch: currentBranch,
       currentBranch,
-      dirty: false,
-      error: `無法判斷工作區狀態：${gitErrorText(err)}`,
+      // **不知道就說不知道**：這裡回 false 會被讀成「工作區乾淨」。
+      dirty: undefined,
+      error: isTimeoutError(err)
+        ? `無法判斷工作區狀態：git status 逾時（${GIT_READ_TIMEOUT_MS / 1000} 秒後被中止）。`
+        : `無法判斷工作區狀態：${gitErrorText(err)}`,
       errorCode: 'git_error',
     };
   }
@@ -348,8 +422,23 @@ export function prepareLocalBranch(
     : ['-C', repoRoot, 'checkout', '-b', branchName];
 
   try {
-    execFileSync('git', args, localGitOptions());
+    // checkout 是寫操作，用獨立的長逾時（見 {@link GIT_WRITE_TIMEOUT_MS}）。
+    execFileSync('git', args, localWriteOptions());
   } catch (err) {
+    // 逾時 ≠ git 拒絕：逾時是「命令被砍在半路」，可能留下半完成的索引，
+    // 使用者要能分辨這兩種情況（處理方式完全不同）。
+    if (isTimeoutError(err)) {
+      return {
+        ok: false,
+        branch: currentBranch,
+        currentBranch,
+        dirty,
+        error:
+          `git checkout ${branchName} 逾時（${GIT_WRITE_TIMEOUT_MS / 1000} 秒後被中止）：` +
+          '命令可能沒跑完，工作區可能處於半完成狀態，請先用 git status 確認。',
+        errorCode: 'git_error',
+      };
+    }
     const detail = gitErrorText(err);
     // 分支被別的 worktree 佔用是最常見的原因，講清楚，使用者才知道要鬆哪裡。
     // git 的說法隨版本而異（"already checked out at" / "already used by worktree"），兩種都認。
