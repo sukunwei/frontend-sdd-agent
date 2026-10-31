@@ -7,7 +7,7 @@ import {
   startTask,
 } from '../commands/start-task.js';
 import type { StartTaskBlocker, StartTaskResult } from '../commands/start-task.js';
-import { hasStageStep, recordStageStep } from '../graph/state.js';
+import { hasStageStep, readStageStep, recordStageStep } from '../graph/state.js';
 import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.js';
 import { acquireLock, forceUnlock, getLock, releaseLock } from '../runtime/branch-lock.js';
 import { SddAbortError } from '../runtime/errors.js';
@@ -86,10 +86,35 @@ export async function bootstrapNode(
   // **使用者答過髒工作區了嗎？**（本節點的台賬）
   // 這是本節點唯一會「問第二次」的危險所在：`proceed` 不改變世界，
   // 沒有這本帳，resume 之後的執行會再問一次。
-  const dirtyApproved = hasStageStep(state, STAGE, STEP_DIRTY_WORKTREE);
+  //
+  // **讀「值」而不是「鍵在不在」**：節點級 reset 會把這一步的值清成空字串
+  // （`stageSteps` 的 reducer 是合併語義，合併刪不掉一個鍵），
+  // 那個鍵還在，但意思是「這一步沒發生過」。
+  let dirtyApproved = readStageStep(state, STAGE, STEP_DIRTY_WORKTREE) === 'proceed';
 
   // Has this execution already asked the user something?
   let asked = false;
+
+  // 節點級 reset 要帶著的台賬變更（「問過了」那一步要清掉）。
+  // 空的話 = 沒有要帶的東西 = state 一個鍵都不會多。
+  let pendingSteps: Record<string, string> = {};
+
+  /**
+   * 把還沒寫進 state 的台賬變更併進結果。
+   *
+   * **結果自己的台賬優先**：reset 清掉的那一步，若同一個執行裡又有了新的
+   * 答案（`proceed`），新答案才是最新的那一步。
+   */
+  const finish = (outcome: NodeOutcome): NodeOutcome => {
+    if (Object.keys(pendingSteps).length === 0) return outcome;
+    return {
+      ...outcome,
+      update: {
+        ...outcome.update,
+        stageSteps: { ...pendingSteps, ...(outcome.update.stageSteps ?? {}) },
+      },
+    };
+  };
 
   // ---- Step 1: does the user have to decide anything? -------------------
   // Read-only: the checks below touch neither the lock nor the workspace.
@@ -102,14 +127,33 @@ export async function bootstrapNode(
       if (!settleLockConflict(action, lockPath)) {
         // The lock is still held → the same question has to be asked again,
         // and that happens in the next execution.
-        return askAgain();
+        return finish(askAgain());
       }
     } else if (action === 'reset') {
       // 'reset': throw the old workspace away and start over.
       cleanupWorkspace(normalizedTaskName);
+      // **台賬也要清**：使用者 reset 的本意是「從頭再來」。若還記著
+      // 「使用者已經批准留在當前分支上工作」，下一個執行會靜默地沿用那個
+      // 決定（在當前分支上幹活），而不是像 reset 的本意那樣切出新的工作分支。
+      //
+      // **用空字串當「沒問過」**：`stageSteps` 的 reducer 是合併
+      // （`mergeRecord`），合併語義刪不掉一個鍵——把值寫成空字串，
+      // 讀取處（`readStageStep(...) === 'proceed'`）就當成「沒答過」。
+      //
+      // **只清真的記過的那一步**：remote 模式從來沒有記過它，
+      // 不清的話 remote 的 state 會多出一個從來沒有的鍵。
+      if (hasStageStep(state, STAGE, STEP_DIRTY_WORKTREE)) {
+        // **這一次執行也不能沿用舊的決定**：reset 的本意是「從頭再來」，
+        // 沿用就變成「靜默地在當前分支上幹活」——那不是使用者要的。
+        dirtyApproved = false;
+        pendingSteps = {
+          ...pendingSteps,
+          ...(recordStageStep(STAGE, STEP_DIRTY_WORKTREE, '').stageSteps ?? {}),
+        };
+      }
     } else if (repoIsCloned(normalizedTaskName)) {
       // 'resume': keep the workspace the previous run prepared.
-      return adoptWorkspace(normalizedTaskName, branch, lockPath);
+      return finish(adoptWorkspace(normalizedTaskName, branch, lockPath));
     } else if (local) {
       // 就地模式沒有「clone 了一半的倉庫」：那個空殼本來就不存在。
       // 刪它只是為了清掉舊版本可能留下的殼——刪不掉也不該讓這輪 run 死在這裡，
@@ -133,7 +177,7 @@ export async function bootstrapNode(
       ...(local && dirtyApproved ? { skipBranchSwitch: true } : {}),
     });
     if (result.success) {
-      return advance(result);
+      return finish(advance(result));
     }
 
     if (result.errorCode === 'dirty_worktree' && !dirtyApproved) {
@@ -142,28 +186,35 @@ export async function bootstrapNode(
       if (asked) {
         // 這一次執行已經問過使用者了（一次執行只能問一次）
         // → 同一個問題留到下一個執行再問。
-        return askAgain();
+        return finish(askAgain());
       }
       const action = actionOf(interrupt(dirtyWorktreePayload(normalizedTaskName)));
       if (action === 'proceed') {
         // **把決定記進台賬**，然後回到自己：下一個執行帶著台賬重跑，
         // 就會走「使用者已經批准過」那條路，不會再問第二次。
-        return {
+        return finish({
           kind: 'advance',
           update: recordStageStep(STAGE, STEP_DIRTY_WORKTREE, 'proceed'),
           goto: 'bootstrap',
-        };
+        });
       }
       if (action === 'abort') {
-        // 使用者喊停：鎖要還回去（否則這個倉庫會一直被鎖住），
-        // checkpoint 留著，使用者還能 resume 這一輪。
-        releaseLock(lockPath);
+        // 使用者喊停：checkpoint 留著，使用者還能 resume 這一輪。
+        //
+        // **只釋放本 task 的鎖**：`releaseLock()` 清的是那個路徑上的**任何**
+        // 鎖，不管屬於誰。而這個 run 在閘口處根本還沒拿到鎖（髒檢查在拿鎖
+        // 之前就回來了），那把鎖可能是同一個倉庫裡另一個 task 的——
+        // 把它清掉，兩個 task 就會同時在一個倉庫裡幹活，
+        // 那正是這把鎖存在的理由。
+        if (getLock(lockPath)?.taskName === normalizedTaskName) {
+          releaseLock(lockPath);
+        }
         throw new SddAbortError(
           '使用者中止了這輪運行：工作區有未提交的改動，未建立工作分支。'
         );
       }
       // 認不出的答案 → 再問一次（不能當成放行）。
-      return askAgain();
+      return finish(askAgain());
     }
 
     if (result.errorCode === 'lock_conflict') {
@@ -181,7 +232,7 @@ export async function bootstrapNode(
       // Whatever the answer was, the next execution starts over with a fresh
       // retry budget - and its pre-check decides whether the lock is still in
       // the way.
-      return askAgain();
+      return finish(askAgain());
     }
 
     if (!isRetryable(result) || attempt >= MAX_ATTEMPTS) {
@@ -194,7 +245,7 @@ export async function bootstrapNode(
       }
       // The answer arrived (the user approved): the next execution tries
       // again, with a fresh retry budget.
-      return askAgain();
+      return finish(askAgain());
     }
   }
 }
