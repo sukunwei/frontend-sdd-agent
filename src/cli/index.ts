@@ -139,7 +139,14 @@ type WireWorkerResult = z.infer<typeof WireWorkerResultSchema>;
 class CliError extends Error {
   constructor(
     readonly code: string,
-    message: string
+    message: string,
+    /**
+     * 機器可讀的補充資料（會一起放進 error 信封）。
+     *
+     * **部分成功也要結構化**：命令做了一半才失敗時，使用者拿得到
+     * 「已經搬了哪些、還有哪些沒搬」，不必從訊息裡的字句猜。
+     */
+    readonly details?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'CliError';
@@ -190,7 +197,13 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     }
   } catch (err) {
     if (err instanceof CliError) {
-      writeErr(envelope('error', { code: err.code, message: err.message }));
+      writeErr(
+        envelope('error', {
+          code: err.code,
+          message: err.message,
+          ...(err.details ?? {}),
+        })
+      );
       return EXIT_ERROR;
     }
     if (err instanceof SddAbortError) {
@@ -690,6 +703,7 @@ async function cmdMigrate(args: ParsedArgs, opts: RunCliOptions): Promise<number
       skippedReasons: Object.fromEntries(
         skipped.map((threadId) => [threadId, '這個倉庫沒有 remote.origin.url，無法判定歸屬'])
       ),
+      mixed: [],
       target: targetDbPath,
       notice: notices.join('；'),
     });
@@ -698,15 +712,23 @@ async function cmdMigrate(args: ParsedArgs, opts: RunCliOptions): Promise<number
 
   const result = await migrateState({ legacyDbPath, targetDbPath, matchUrl: remoteUrl });
   if (result.error !== undefined) {
-    // **已經搬走的也要講清楚**：使用者看到錯誤時要知道東西搬到哪裡了。
-    throw new CliError(
-      'internal_error',
-      `${result.error}（已搬：${result.migrated.join(', ') || '無'}）`
-    );
+    // **部分成功也要結構化**：使用者拿得到「已經搬了哪些、還有哪些沒搬」，
+    // 不必從訊息裡的字句猜。
+    throw new CliError('internal_error', result.error, {
+      migrated: result.migrated,
+      skipped: result.skipped,
+      skippedReasons: result.skippedReasons ?? {},
+      mixed: result.mixed ?? [],
+    });
   }
 
   if (result.migrated.length === 0) {
     notices.push('沒有可搬的 thread（都已經搬過了，或剩下的不屬於這個倉庫）');
+  }
+  if ((result.mixed ?? []).length > 0) {
+    notices.push(
+      `有 ${(result.mixed ?? []).length} 條 thread 混了兩個倉庫的 checkpoint，沒有搬（請手動處理）`
+    );
   }
 
   emitResult({
@@ -714,6 +736,7 @@ async function cmdMigrate(args: ParsedArgs, opts: RunCliOptions): Promise<number
     migrated: result.migrated,
     skipped: result.skipped,
     skippedReasons: result.skippedReasons ?? {},
+    mixed: result.mixed ?? [],
     target: targetDbPath,
     ...(result.backupPath === undefined ? {} : { backup: result.backupPath }),
     notice: notices.join('；'),

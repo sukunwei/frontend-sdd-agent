@@ -50,7 +50,20 @@ export interface MigrateResult {
    * **一定要說清楚**：使用者要知道哪些沒被搬、為什麼——不然他只能自己去猜。
    */
   skippedReasons?: Record<string, string>;
-  /** 備份檔的位置（沒搬任何東西時是 undefined）。 */
+  /**
+   * 混了兩個倉庫的 thread 名。
+   *
+   * **這些 thread 一個 checkpoint 都沒有搬**：同一個 task 名在兩個倉庫跑過，
+   * 舊庫裡只有一條 thread，兩個倉庫的 checkpoint 交錯在同一條 parent 鏈上。
+   * 搬整條等於把別的倉庫的進度一起搬過來——正是這次改造要修的那個 bug。
+   */
+  mixed?: string[];
+  /**
+   * 備份檔的位置。
+   *
+   * **舊庫存在就會備份**（不管有沒有東西可搬）：備份是搬運前的保險，
+   * 沒有東西可搬時它也只是一份等值的副本。
+   */
   backupPath?: string;
 }
 
@@ -128,7 +141,7 @@ export async function listLegacyThreads(legacyDbPath: string): Promise<string[]>
  * @returns 搬走的、留下的，以及（失敗時）原因
  */
 export async function migrateState(opts: MigrateOptions): Promise<MigrateResult> {
-  const result: MigrateResult = { migrated: [], skipped: [], skippedReasons: {} };
+  const result: MigrateResult = { migrated: [], skipped: [], skippedReasons: {}, mixed: [] };
 
   // **舊庫不存在不是錯誤**：沒有東西可搬而已。
   if (!fs.existsSync(opts.legacyDbPath)) {
@@ -171,6 +184,9 @@ export async function migrateState(opts: MigrateOptions): Promise<MigrateResult>
           result.migrated.push(threadId);
         } else {
           result.skipped.push(threadId);
+          if (decision.kind === 'mixed' && result.mixed) {
+            result.mixed.push(threadId);
+          }
           if (result.skippedReasons) {
             result.skippedReasons[threadId] = decision.reason;
           }
@@ -194,7 +210,10 @@ export async function migrateState(opts: MigrateOptions): Promise<MigrateResult>
 }
 
 /** 一個 thread 的搬運結果。 */
-type ThreadDecision = { kind: 'migrated' } | { kind: 'skipped'; reason: string };
+type ThreadDecision =
+  | { kind: 'migrated' }
+  | { kind: 'skipped'; reason: string }
+  | { kind: 'mixed'; reason: string };
 
 /**
  * 搬一個 thread（或決定不搬它）。
@@ -214,14 +233,35 @@ async function migrateThread(
     return { kind: 'skipped', reason: '舊庫裡讀不到這個 thread 的 checkpoint' };
   }
 
-  const repoUrl = repoUrlOf(tuples);
+  // **歸屬要看的不是「最新那個 checkpoint」，而是整條 thread**。
+  //
+  // 舊庫以 task 名當 thread id，而舊庫是全域的：兩個倉庫跑過同名 task 時，
+  // 舊庫裡只有**一條** thread，兩個倉庫的 checkpoint 交錯在同一條 parent 鏈上。
+  // 只看最新那個會以為整條 thread 都屬於它——搬過去等於把別的倉庫的進度
+  // 一起搬走（`repoUrl` 那個 channel 是後寫蓋先寫，誰最後跑誰贏）。
+  // 那正是這次改造要修的 bug，遷移工具自己不能犯。
+  const repoUrls = repoUrlsOf(tuples);
+  if (repoUrls.size > 1) {
+    return {
+      kind: 'mixed',
+      reason:
+        `這個 thread 混了兩個倉庫的 checkpoint（${[...repoUrls].join('、')}），` +
+        '請手動處理',
+    };
+  }
+
+  const repoUrl = repoUrls.size === 1 ? [...repoUrls][0] : undefined;
   if (opts.matchUrl !== undefined && repoUrl !== opts.matchUrl) {
     return {
       kind: 'skipped',
       reason:
         repoUrl === undefined
           ? '讀不到 repoUrl，無法判定歸屬'
-          : `屬於別的倉庫（舊庫的 repoUrl：${repoUrl}）`,
+          : // **只說「不一致」，不要說「屬於別的倉庫」**：舊庫存的是使用者當初
+            // 敲的 `--repo` 字串（可能是 `git@github.com:x/y.git`），跟
+            // `remote.origin.url` 的寫法不一定一樣——那時這條 thread 未必屬於
+            // 別的倉庫，只是地址寫法不同。
+            `repoUrl 與本倉庫不一致（舊庫的 repoUrl：${repoUrl}）`,
     };
   }
 
@@ -245,6 +285,11 @@ async function migrateThread(
  * 住在另一張表裡，只搬 checkpoint 會讓這輪 run 變成「沒有 pending」，
  * `resume` 之後就接不上來了。
  *
+ * **搬一半要清掉**：寫到一半出錯（磁碟滿、權限…）會在目標庫留下前幾個
+ * checkpoint（parent 鏈斷在半路）。那半截 thread 會讓「目標庫裡已經有同名
+ * thread」的檢查誤判成「已經搬過了」——下次執行就永遠補不齊，只能手改
+ * 資料庫。所以失敗時把這條 thread 從目標庫刪掉。
+ *
  * @param target - 目標庫的 saver
  * @param threadId - thread 名
  * @param tuples - 這個 thread 的所有 checkpoint
@@ -254,46 +299,75 @@ async function copyThread(
   threadId: string,
   tuples: CheckpointTuple[]
 ): Promise<void> {
-  for (const tuple of tuples) {
-    const configurable = configurableOf(tuple);
-    const namespace =
-      typeof configurable.checkpoint_ns === 'string' ? configurable.checkpoint_ns : '';
+  try {
+    for (const tuple of tuples) {
+      const configurable = configurableOf(tuple);
+      const namespace =
+        typeof configurable.checkpoint_ns === 'string' ? configurable.checkpoint_ns : '';
 
-    // **parent 的 id 要照抄**：parent 關係是 checkpoint 鏈的骨幹，搬過去之後
-    // 新庫裡的這條鏈才接得起來。
-    const parentConfigurable: unknown = tuple.parentConfig?.configurable;
-    const parentIdRaw =
-      typeof parentConfigurable === 'object' && parentConfigurable !== null
-        ? (parentConfigurable as Record<string, unknown>).checkpoint_id
-        : undefined;
-    const parentId = typeof parentIdRaw === 'string' ? parentIdRaw : undefined;
+      // **parent 的 id 要照抄**：parent 關係是 checkpoint 鏈的骨幹，搬過去之後
+      // 新庫裡的這條鏈才接得起來。
+      const parentConfigurable: unknown = tuple.parentConfig?.configurable;
+      const parentIdRaw =
+        typeof parentConfigurable === 'object' && parentConfigurable !== null
+          ? (parentConfigurable as Record<string, unknown>).checkpoint_id
+          : undefined;
+      const parentId = typeof parentIdRaw === 'string' ? parentIdRaw : undefined;
 
-    await target.put(
-      {
-        configurable: {
-          thread_id: threadId,
-          checkpoint_ns: namespace,
-          ...(parentId === undefined ? {} : { checkpoint_id: parentId }),
-        },
-      },
-      tuple.checkpoint,
-      tuple.metadata ?? { source: 'loop', step: 0, parents: {} }
-    );
-
-    for (const [taskId, writes] of groupWrites(tuple.pendingWrites ?? [])) {
-      await target.putWrites(
+      await target.put(
         {
           configurable: {
             thread_id: threadId,
             checkpoint_ns: namespace,
-            checkpoint_id: tuple.checkpoint.id,
+            ...(parentId === undefined ? {} : { checkpoint_id: parentId }),
           },
         },
-        writes,
-        taskId,
-        ''
+        tuple.checkpoint,
+        tuple.metadata ?? { source: 'loop', step: 0, parents: {} }
       );
+
+      for (const [taskId, writes] of groupWrites(tuple.pendingWrites ?? [])) {
+        await target.putWrites(
+          {
+            configurable: {
+              thread_id: threadId,
+              checkpoint_ns: namespace,
+              checkpoint_id: tuple.checkpoint.id,
+            },
+          },
+          writes,
+          taskId,
+          ''
+        );
+      }
     }
+  } catch (err) {
+    // **清掉半截的 thread**：留著它，下次執行會被判成「已經有同名 thread」
+    // 而永遠跳過。
+    const cleaned = await deleteThreadQuietly(target, threadId);
+    throw new Error(
+      cleaned
+        ? errorMessage(err)
+        : `${errorMessage(err)}（而且半截的資料清不掉，請手動清理目標庫裡的這條 thread）`
+    );
+  }
+}
+
+/**
+ * 從目標庫刪掉一條 thread。
+ *
+ * **清不掉要說清楚**：清不掉的使用者得自己動手，訊息裡得寫出來。
+ *
+ * @param target - 目標庫的 saver
+ * @param threadId - thread 名
+ * @returns 有沒有清掉
+ */
+async function deleteThreadQuietly(target: SqliteSaver, threadId: string): Promise<boolean> {
+  try {
+    await target.deleteThread(threadId);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -333,20 +407,24 @@ async function readThreads(saver: SqliteSaver): Promise<Map<string, CheckpointTu
 }
 
 /**
- * 這個 thread 的 `repoUrl`。
+ * 這個 thread 裡出現過的 `repoUrl`。
  *
- * **取最新的那個 checkpoint**：state 的 `repoUrl` 是開跑時寫進去的，不會變。
+ * **空字串不算**：thread 的第一個 checkpoint（`source: 'input'`）是在輸入被
+ * 套進 channel 之前寫的，`repoUrl` 還是空的——那不是「另一個倉庫」，
+ * 只是還沒寫進去。
  *
- * @param tuples - 這個 thread 的所有 checkpoint（新的在前）
+ * @param tuples - 這個 thread 的所有 checkpoint
+ * @returns 出現過的非空 repoUrl
  */
-function repoUrlOf(tuples: CheckpointTuple[]): string | undefined {
+function repoUrlsOf(tuples: CheckpointTuple[]): Set<string> {
+  const urls = new Set<string>();
   for (const tuple of tuples) {
     const values: unknown = tuple.checkpoint.channel_values;
     if (typeof values !== 'object' || values === null) continue;
     const url = (values as Record<string, unknown>).repoUrl;
-    if (typeof url === 'string' && url !== '') return url;
+    if (typeof url === 'string' && url !== '') urls.add(url);
   }
-  return undefined;
+  return urls;
 }
 
 /**
@@ -354,21 +432,39 @@ function repoUrlOf(tuples: CheckpointTuple[]): string | undefined {
  *
  * **備份必須是完整的**：sqlite 預設是 WAL 模式，還沒收進主檔的資料住在
  * `-wal` 側檔裡——只複製主檔會備份到一個看起來正常、其實是空的資料庫。
- * 所以先要求 sqlite 把 WAL 收乾淨；收不乾淨就把側檔一起複製（檔名沿用
- * sqlite 的慣例 `<庫>-wal`，sqlite 才認得出來）。
+ * 所以先要求 sqlite 把 WAL 收乾淨；收不乾淨就把側檔一起複製。
+ *
+ * **側檔要 `-wal` 與 `-shm` 兩個都複製**：`-shm` 是 WAL 的索引，
+ * 少了它 sqlite 在只讀開檔時重建不了索引（要能寫才能重建）——那份備份
+ * 就變成「開得起但讀不出來」。檔名沿用 sqlite 的慣例 `<庫>-wal` /
+ * `<庫>-shm`，sqlite 才認得出來那是同一個資料庫的側檔。
  *
  * @param saver - 舊庫的 saver
  * @param legacyDbPath - 舊庫的路徑
+ * @param flush - 把 WAL 收進主檔的步驟（測試可以讓它失敗，走側檔退路）
  * @returns 備份檔的路徑
  */
-function backupLegacyDb(saver: SqliteSaver, legacyDbPath: string): string {
+export function backupLegacyDb(
+  saver: SqliteSaver,
+  legacyDbPath: string,
+  flush: (saver: SqliteSaver) => void = flushWal
+): string {
   const backupPath = `${legacyDbPath}.bak`;
-  flushWal(saver);
+  try {
+    flush(saver);
+  } catch {
+    // 收不乾淨就靠側檔退路。
+  }
   fs.copyFileSync(legacyDbPath, backupPath);
 
+  // **只有 WAL 還有資料時才需要側檔**：收乾淨的話主檔本身就是完整的。
   const walPath = `${legacyDbPath}-wal`;
   if (fs.existsSync(walPath) && fs.statSync(walPath).size > 0) {
     fs.copyFileSync(walPath, `${backupPath}-wal`);
+    const shmPath = `${legacyDbPath}-shm`;
+    if (fs.existsSync(shmPath) && fs.statSync(shmPath).size > 0) {
+      fs.copyFileSync(shmPath, `${backupPath}-shm`);
+    }
   }
   return backupPath;
 }
