@@ -4,6 +4,7 @@ import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { Command } from '@langchain/langgraph';
 import { z } from 'zod';
+import { listLegacyThreads, migrateState } from '../commands/migrate-state.js';
 import { buildGraph } from '../graph/compile.js';
 import type { CompiledSddGraph } from '../graph/compile.js';
 import { measureFidelity } from '../figma/fidelity.js';
@@ -55,6 +56,7 @@ import type { RejectionReason, WorkOrder } from './protocol.js';
  * sdd-graph approve  --task <n> --payload <json|@file>
  * sdd-graph status   --task <n>
  * sdd-graph stop     --task <n> [--force]
+ * sdd-graph migrate  [--repo <path>]     （把舊的全域 checkpoint 搬進 .sdd/）
  * sdd-graph change   --task <n>          （v1 只預留：回 1 not_implemented）
  * sdd-graph figma-diff --docs <dir> [--repo <dir>]
  * ```
@@ -108,6 +110,13 @@ export interface RunCliOptions {
   checkpointPath?: string;
   /** Branch lock file to use instead of the plugin-root default. */
   lockPath?: string;
+  /**
+   * 舊的全域 checkpoint 庫（`migrate` 用）。
+   *
+   * 預設是外掛根底下的那一份；測試指向臨時目錄——否則測試會動到開發者
+   * 自己正在用的舊庫。
+   */
+  legacyCheckpointPath?: string;
 }
 
 /**
@@ -170,6 +179,8 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         return await cmdStatus(args, opts);
       case 'stop':
         return await cmdStop(args, opts);
+      case 'migrate':
+        return await cmdMigrate(args, opts);
       case 'change':
         return cmdChange();
       case 'figma-diff':
@@ -628,6 +639,89 @@ async function cmdStop(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
 }
 
 /**
+ * `migrate [--repo <path>]`：把舊的全域 checkpoint 搬進業務倉庫的 `.sdd/` 之下。
+ *
+ * **搬運是逐個 thread 判歸屬的，不是整庫複製**：舊庫裡可能躺著好幾個倉庫的
+ * run，整庫複製會把別的倉庫的 run 也搬過來——那正是這次改造要修的問題。
+ * 判準只有一個：舊 thread 的 `repoUrl` 是不是等於這個倉庫的
+ * `remote.origin.url`。
+ *
+ * **沒有遠端地址就一條都不搬**：沒有判準就沒有歸屬，硬搬就是把別的倉庫的 run
+ * 搬過來。舊庫原封不動留著（搬運前會備份一份 `.bak`），剩下的由使用者確認
+ * 後自己清理。
+ *
+ * @throws CliError `validation_error` —— `--repo` 不是一個本機倉庫。
+ */
+async function cmdMigrate(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
+  const repoSpec = args.flags.get('repo') ?? process.cwd();
+  const resolved = resolveRepo(repoSpec, process.cwd());
+  if (resolved.mode !== 'local') {
+    throw new CliError(
+      'validation_error',
+      'migrate 需要一個本機倉庫（狀態要搬進那個倉庫的 .sdd/ 之下）；' +
+        `--repo 給的是遠端網址（${resolved.remoteUrl ?? repoSpec}），請改成倉庫路徑`
+    );
+  }
+  const repoRoot = canonicalRepoRoot(resolved.repoRoot);
+  const legacyDbPath =
+    opts.legacyCheckpointPath ?? path.join(getPluginRoot(), 'runtime', 'checkpoints.sqlite');
+  const targetDbPath = path.join(defaultSddHome(repoRoot), 'checkpoints.sqlite');
+  const remoteUrl = readRemoteOriginUrl(repoRoot);
+
+  const notices: string[] = [];
+
+  // **舊鎖不遷**：那把鎖是全域單例，可能握在別的倉庫的 task 手上——動它就是
+  // 動到別人正在跑的那一輪。只提示，不碰。
+  const legacyLock = getLock(path.join(path.dirname(legacyDbPath), 'branch-runtime-lock.json'));
+  if (legacyLock?.running) {
+    notices.push(
+      `舊的分支鎖仍指向 ${legacyLock.taskName}，請先 stop 那個 task（遷移不會動鎖）`
+    );
+  }
+
+  if (remoteUrl === undefined) {
+    // **沒有遠端地址就無法判定歸屬**：一條都不搬，只把還在舊庫的 thread 報出來。
+    const skipped = await listLegacyThreads(legacyDbPath);
+    notices.unshift('這個倉庫沒有 remote.origin.url，無法判定歸屬，所以一條都沒搬');
+    emitResult({
+      command: 'migrate',
+      migrated: [],
+      skipped,
+      skippedReasons: Object.fromEntries(
+        skipped.map((threadId) => [threadId, '這個倉庫沒有 remote.origin.url，無法判定歸屬'])
+      ),
+      target: targetDbPath,
+      notice: notices.join('；'),
+    });
+    return EXIT_OK;
+  }
+
+  const result = await migrateState({ legacyDbPath, targetDbPath, matchUrl: remoteUrl });
+  if (result.error !== undefined) {
+    // **已經搬走的也要講清楚**：使用者看到錯誤時要知道東西搬到哪裡了。
+    throw new CliError(
+      'internal_error',
+      `${result.error}（已搬：${result.migrated.join(', ') || '無'}）`
+    );
+  }
+
+  if (result.migrated.length === 0) {
+    notices.push('沒有可搬的 thread（都已經搬過了，或剩下的不屬於這個倉庫）');
+  }
+
+  emitResult({
+    command: 'migrate',
+    migrated: result.migrated,
+    skipped: result.skipped,
+    skippedReasons: result.skippedReasons ?? {},
+    target: targetDbPath,
+    ...(result.backupPath === undefined ? {} : { backup: result.backupPath }),
+    notice: notices.join('；'),
+  });
+  return EXIT_OK;
+}
+
+/**
  * `change --task <n>`: the entry point of v1, and nothing else.
  *
  * **The command does not exist yet, and it says so.** The old
@@ -1041,6 +1135,29 @@ function resolveLockPath(threadId: string): string {
 }
 
 /**
+ * 這個倉庫的遠端網址（`remote.origin.url`）。
+ *
+ * **沒有遠端就回傳 undefined**：遷移靠它判定歸屬，沒有判準就不能搬
+ * （見 `cmdMigrate`）。
+ *
+ * @param repoRoot - 業務倉庫根
+ * @returns 遠端網址；倉庫沒有遠端（或 git 失敗）時是 undefined
+ */
+function readRemoteOriginUrl(repoRoot: string): string | undefined {
+  try {
+    const url = execFileSync('git', ['-C', repoRoot, 'config', '--get', 'remote.origin.url'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, LC_ALL: 'C' },
+    }).trim();
+    return url === '' ? undefined : url;
+  } catch {
+    // 沒有遠端（或 git 失敗）。
+    return undefined;
+  }
+}
+
+/**
  * 就地模式寫進 state 的倉庫標記。
  *
  * **不能是本機絕對路徑**：那份鏡像要進版本庫，寫進去的是每台機器都不一樣的
@@ -1050,17 +1167,9 @@ function resolveLockPath(threadId: string): string {
  * @param repoRoot - 業務倉庫根
  */
 function localRepoUrl(repoRoot: string): string {
-  try {
-    const url = execFileSync('git', ['-C', repoRoot, 'config', '--get', 'remote.origin.url'], {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, LC_ALL: 'C' },
-    }).trim();
-    if (url !== '' && !looksLikeLocalPath(url)) {
-      return url;
-    }
-  } catch {
-    // 沒有遠端（或 git 失敗）：改用目錄名。
+  const url = readRemoteOriginUrl(repoRoot);
+  if (url !== undefined && !looksLikeLocalPath(url)) {
+    return url;
   }
   return `local:${path.basename(repoRoot)}`;
 }
