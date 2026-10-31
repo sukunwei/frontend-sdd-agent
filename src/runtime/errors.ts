@@ -9,7 +9,9 @@ export type ErrorCode =
   | 'network_error'
   | 'permission_error'
   | 'infra_error'
-  | 'cleanup_failed';
+  | 'cleanup_failed'
+  /** 就地模式：工作區有已跟蹤文件的改動，必須由使用者決定怎麼辦。 */
+  | 'dirty_worktree';
 
 /**
  * Error categories for recovery strategy selection.
@@ -50,6 +52,10 @@ export function classifyError(errorCode: ErrorCode): ErrorCategory {
       return 'infra_error';
     case 'cleanup_failed':
       return 'infra_error';
+    // 髒工作區不是「再試一次就會好」的錯：重試只是把同一份未提交的改動
+    // 再帶走一次，必須由使用者決定（提交、暫存，或留在當前分支上工作）。
+    case 'dirty_worktree':
+      return 'needs_human';
     default:
       return 'needs_human';
   }
@@ -107,6 +113,8 @@ export function createError(
     permission_error: 'Check git credentials and repository access permissions.',
     infra_error: 'Report this issue. Try --force-unlock as workaround.',
     cleanup_failed: 'Manually remove the task directory and use --force-unlock.',
+    dirty_worktree:
+      '工作區有未提交的改動：先提交或暫存再重新啟動，或確認留在當前分支上工作。',
   };
 
   return {
@@ -132,4 +140,5 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   permission_error: 'Permission denied',
   infra_error: 'Infrastructure error',
   cleanup_failed: 'Cleanup operation failed',
+  dirty_worktree: '工作區有未提交的改動',
 };

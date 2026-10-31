@@ -332,8 +332,11 @@ export function currentBranchName(repoRoot: string): string {
  *
  * 用 `refs/heads/<name>` 精確比對本地分支（不看遠端分支，
  * 也不看同名檔案或 tag）。`--quiet` 讓「不存在」只是退出碼 1，不噴錯誤訊息。
+ *
+ * @param repoRoot - 倉庫根目錄
+ * @param branchName - 分支名（不含 `refs/heads/`）
  */
-function localBranchExists(repoRoot: string, branchName: string): boolean {
+export function localBranchExists(repoRoot: string, branchName: string): boolean {
   try {
     execFileSync(
       'git',
