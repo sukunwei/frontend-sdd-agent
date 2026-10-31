@@ -187,6 +187,8 @@ claude plugin list | grep -A 4 sdd-graph
   `discovery.md`、`spec.md`、`e2e-plan.csv`、`tasks.md`、
   `workflow-state.json`、`verify/*.log`，以及實作出來的程式碼與測試。
   **外掛不會替你 commit 或 push** —— 產物留在那條分支上，等你看過再自己提交、合併。
+  （**程式碼由工人 commit 在那條分支上**；`docs/<name>/` 與「要不要合併回你的主分支」
+  由你處理。）
 - **在你的 repo 裡**：`.sdd/`（`checkpoints.sqlite` 這一輪的進度、`branch-lock.json`
   這個倉庫的分支鎖）。這是**運行時狀態，建議加進 `.gitignore`**（插件只提示，不代勞）。
 
@@ -244,8 +246,9 @@ claude plugin list | grep -A 4 sdd-graph
 ### 行為變更（從舊版升上來）
 
 1. **`--repo <本地路徑>` 的語義變了**：以前是「把這個路徑 clone 一份到外掛目錄」，
-   現在是「**就地工作**」（在**那個**倉庫裡幹活）。要保留舊行為請改用 `file://`
-   前綴（`--repo file:///絕對/路徑`）。
+   現在會被判成「**就地工作**」的路徑 —— **但只有在它就是 cwd 所在的倉庫時才成立**
+   （`--repo .` 可以）；指向別的倉庫會被拒絕（見下一條）。要保留舊行為請改用
+   `file://` 前綴（`--repo file:///絕對/路徑`）。
 2. **`--repo` 指向 cwd 之外的本地倉庫會被拒絕**（就地模式要求在業務倉庫目錄裡執行）：
    錯誤訊息是「就地模式要求在業務倉庫目錄裡執行」。那條路徑會造成「啟動了卻再也
    找不到」的 run —— 在 repo A 啟動、在 repo B 裡 resume，這輪 run 會被綁到 B 的
@@ -296,7 +299,7 @@ sdd-graph migrate --repo <你的業務倉庫路徑>
 | **是個 git repo** | 就地模式：你的專案本身就得是 git repo（外掛就在它裡工作）。克隆模式：能被 clone（https／ssh／`file://`／本機路徑都可以）。不需要先有 `main` 分支以外的東西。 |
 | **四道關卡的工具** | 驗證階段會在**目標 repo**（就地模式 = 你的倉庫；克隆模式 = 副本）裡跑這四個指令（**版本寫死在 `src/nodes/verify-checks.ts`**）：<br>`npx tsc --noEmit` ／ `npx eslint . --ext .ts,.tsx --fix` ／ `npx jest --passWithNoTests --no-coverage` ／ `npx playwright test` |
 | **eslint 8** | `--ext` 這個選項在 eslint 9 已被移除。專案裡要有 `eslint`（v8）與一份設定檔。 |
-| **可以 commit** | 工人（會話）會把工作 commit 在 `task/<name>` 分支上；**外掛自己不 commit、不 push**。 |
+| **可以 commit** | 工人（會話）會把工作 commit 在 `task/<name>` 分支上。**就地模式：外掛自己不 commit、不 push**（推上遠端與合併是你的動作）；**克隆模式：外掛會在建分支時 push 一次**（推不上去不影響流程，分支留在本地），之後的 commit 一樣由工人做。 |
 | **（選配）Figma MCP** | 你在 PRD 階段給了 Figma 網址時，會話會用 Figma MCP 抓設計資源。 |
 
 > **想改關卡的指令？** v1 把它寫死了 —— 這是刻意的：那四道關卡就是這個外掛的
@@ -313,12 +316,12 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 
 | 階段 | 誰執行 | 產出 | 閘口 |
 |---|---|---|---|
-| `bootstrap` | 確定性（圖內） | workspace、分支鎖、clone、run-metadata | 鎖衝突／舊 run 要 resume 還是 reset |
+| `bootstrap` | 確定性（圖內） | 工作分支、分支鎖、run-metadata（**clone 只在克隆模式**；就地模式直接用你的倉庫） | 鎖衝突／舊 run 要 resume 還是 reset（就地模式另加：工作區髒了要你決定） |
 | `prd` | **先問人** | `prd.md`、`design.md`、`refs/*`、`figma/*`（含 HTML 原型） | `collect_prd` →（有 Figma URL 才）`figma_fetch` → `figma_prototype` → 量測 →（必要時）`figma_polish` → `confirm_prd` |
 | `spec` | 工作單 | `discovery.md` + `spec.md` | 澄清最多 3 輪、blocking TBC 未解不得離開、`confirm_spec` |
 | `e2ePlan` | 工作單 | `e2e-plan.csv` | `confirm_e2e` |
 | `taskSplit` | 工作單 | `tasks.md` | `L` 要看起來像一個行為（≥3 條驗收條件）、id 不得重複、id 要由標題派生、`confirm_tasks` |
-| `tdd` | 工作單 × N（開發者 → 審查） | 程式碼、測試、評審 JSON | 失敗兩次 rollback、第三次問使用者 |
+| `tdd` | 工作單 × N（開發者 → 審查） | 程式碼、測試、評審 JSON | 失敗兩次 rollback（**就地模式不回滾**）、第三次問使用者 |
 | `verification` | 確定性（圖內） | 四道關卡的結果 | `lint:ts` → `lint` →（`test` ∥ `e2e`），失敗要使用者決定 |
 
 ### 流程圖
@@ -330,7 +333,7 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 flowchart TD
   START(["start"]) --> BOOT
 
-  BOOT["<b>bootstrap</b> · 確定性<br/>工作區・全域分支鎖・clone 專案"]
+  BOOT["<b>bootstrap</b> · 確定性<br/>工作區・分支鎖・clone 專案<br/>（clone 只在克隆模式；就地模式直接用你的倉庫，鎖按倉庫）"]
   BOOT --> PRD
 
   PRD["<b>prd</b> · 先問人<br/>需求由使用者給，不是模型編的"]
@@ -400,7 +403,8 @@ flowchart TD
 **TDD 迴圈**是兩張單一輪：會話拿到 `developer` 工作單（要寫實作**和**測試）→
 `reviewer`（一次回答兩個問題：有沒有做到驗收條件？寫得好而且是對的嗎？）。
 評審不通過就回到 developer。連續失敗會 `rollback`（回到這個 task 起的 git 標籤），
-第三次才會問使用者。
+第三次才會問使用者。**就地模式不會 rollback、也沒有標籤** —— 壞代碼原樣留在你的
+倉庫裡，由你手動收拾。
 
 > **以前是三張單**：規格審查與品質審查各一張。兩張單讀的是同一批檔案、同一份 diff，
 > 第二次來回買到的東西很少 —— 每個 task 因此少付一次來回。
@@ -422,7 +426,7 @@ flowchart TD
   A1 -->|"再失敗"| A2{"第 2 次失敗"}
   A2 -->|"再失敗"| A3{"第 3 次失敗"}
 
-  A2 --> RB["<b>rollback</b><br/>git reset 回這個 task 起的標籤"]
+  A2 --> RB["<b>rollback</b><br/>git reset 回這個 task 起的標籤<br/>（就地模式不會 rollback，也沒有標籤）"]
   RB --> RBQ{{"<b>tdd_rollback</b><br/>使用者決定：wait / skip / abort"}}
 
   A3 --> BLQ{{"<b>tdd_blocked</b><br/>使用者決定：wait / skip / abort"}}
@@ -461,7 +465,7 @@ flowchart TD
 
 ```
 LOOP:
-  1. 執行 sdd-graph start --task <taskName> --repo <repoUrl>
+  1. 執行 sdd-graph start --task <taskName> [--repo <repoUrl>]
   2. 依退出碼分支：
      - exit 0：階段已完成，向使用者回報，結束
      - exit 2：讀 stdout 的 JSON 信封，依 audience 分支
