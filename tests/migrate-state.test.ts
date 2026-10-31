@@ -264,14 +264,30 @@ describe('migrate：把舊的全域 checkpoint 搬進業務倉庫', () => {
     expect(result.migrated).toEqual([]);
     expect(result.skipped).toEqual(['thr-mixed']);
     expect(result.mixed).toEqual(['thr-mixed']);
-    expect(result.skippedReasons?.['thr-mixed']).toContain('混了兩個倉庫');
+    expect(result.skippedReasons?.['thr-mixed']).toContain('repoUrl 寫法');
     // **整條都不搬**：搬一半就是把別的倉庫的進度搬過來。
     expect(await readTuple(targetDb, 'thr-mixed')).toBeUndefined();
   });
 
-  it('repoUrl 只是寫法不同時也不搬（理由說「不一致」）', async () => {
-    // 舊庫存的是使用者當初敲的 `--repo` 字串，不是 `git config` 的結果。
+  it('repoUrl 只是寫法不同時照樣搬（同一個倉庫）', async () => {
+    // 舊庫存的是使用者當初敲的 `--repo` 字串，不是 `git config` 的結果：
+    // `git@github.com:example/demo.git` 與 `https://github.com/example/demo.git`
+    // 是同一個倉庫，正規化之後要認得出來。
     await seedThread(legacyDb, 'thr-a', 'git@github.com:example/demo.git');
+
+    const result = await migrateState({
+      legacyDbPath: legacyDb,
+      targetDbPath: targetDb,
+      matchUrl: REPO_URL,
+    });
+
+    expect(result.migrated).toEqual(['thr-a']);
+    expect(result.skipped).toEqual([]);
+    expect(await readTuple(targetDb, 'thr-a')).toBeDefined();
+  });
+
+  it('repoUrl 真的不同時不搬（理由說「不一致」）', async () => {
+    await seedThread(legacyDb, 'thr-a', OTHER_URL);
 
     const result = await migrateState({
       legacyDbPath: legacyDb,
@@ -283,6 +299,22 @@ describe('migrate：把舊的全域 checkpoint 搬進業務倉庫', () => {
     expect(result.skipped).toEqual(['thr-a']);
     expect(result.skippedReasons?.['thr-a']).toContain('不一致');
     expect(result.skippedReasons?.['thr-a']).not.toContain('屬於別的倉庫');
+  });
+
+  it('同一個倉庫的兩種寫法不算「混了兩個倉庫」', async () => {
+    // 這一條以前會被判成 mixed：一個 checkpoint 都搬不過去，而且沒有覆寫的出口。
+    await seedThread(legacyDb, 'thr-a', 'https://github.com/example/demo.git');
+    await putCheckpoint(legacyDb, 'thr-a', 'git@github.com:example/demo.git', 'same-repo');
+
+    const result = await migrateState({
+      legacyDbPath: legacyDb,
+      targetDbPath: targetDb,
+      matchUrl: REPO_URL,
+    });
+
+    expect(result.mixed).toEqual([]);
+    expect(result.migrated).toEqual(['thr-a']);
+    expect(result.skipped).toEqual([]);
   });
 
   it('搬運中途失敗時不會留下半截 thread', async () => {

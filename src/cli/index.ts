@@ -21,6 +21,7 @@ import {
 } from '../runtime/branch-lock.js';
 import { createError, SddAbortError } from '../runtime/errors.js';
 import {
+  assertSddHomeSeparate,
   canonicalRepoRoot,
   getCheckpointPath,
   getDocsDir,
@@ -28,7 +29,7 @@ import {
   getPluginRoot,
   getWorkspaceBase,
 } from '../runtime/paths.js';
-import { defaultSddHome, setRunContext } from '../runtime/run-context.js';
+import { defaultSddHome, isLocalMode, setRunContext } from '../runtime/run-context.js';
 import type { RepoMode, RunContext } from '../runtime/run-context.js';
 import { gitTopLevel, RepoResolutionError, resolveRepo } from '../runtime/repo-resolver.js';
 import type { ResolvedRepo } from '../runtime/repo-resolver.js';
@@ -199,9 +200,12 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     if (err instanceof CliError) {
       writeErr(
         envelope('error', {
+          // **`details` 先鋪，`code`/`message` 後蓋**：`details` 是呼叫端給的
+          // 補充資料，它不該有權改掉錯誤碼與錯誤訊息（那會讓宿主讀到
+          // 一個自相矛盾的信封）。
+          ...(err.details ?? {}),
           code: err.code,
           message: err.message,
-          ...(err.details ?? {}),
         })
       );
       return EXIT_ERROR;
@@ -275,7 +279,16 @@ async function cmdStart(args: ParsedArgs, opts: RunCliOptions): Promise<number> 
   if (resolved.mode === 'local') {
     assertSameRepoAsCwd(resolved.repoRoot);
   }
-  setRunContext(contextOf(resolved));
+  // **狀態根不得就是業務倉庫根**（見 {@link assertSddHomeSeparate}）：
+  // 那會讓清理刪掉使用者自己的 `tasks/`、`runs/` 目錄。這要在建圖之前
+  // 就擋下來——使用者要改的是環境變數，不是「跑到一半才失敗」。
+  let context: RunContext;
+  try {
+    context = contextOf(resolved);
+  } catch (err) {
+    throw new CliError('validation_error', errorMessage(err));
+  }
+  setRunContext(context);
 
   // 就地模式不該把本機絕對路徑寫進要進版本庫的 `workflow-state.json` 鏡像：
   // 寫遠端地址，寫不出來就寫 `local:<目錄名>`。
@@ -612,9 +625,38 @@ async function cmdStatus(args: ParsedArgs, opts: RunCliOptions): Promise<number>
       pending: pending
         ? { audience: audienceOf(pending.value) ?? 'user', type: typeOf(pending.value) }
         : null,
+      // **分支鎖也要報**：使用者要看得見「現在是誰握著鎖」——
+      // 鎖在哪個檔案、握著的是哪個 task、哪條分支。
+      lock: lockReport(lockPathOf(opts, graph)),
     });
     return EXIT_OK;
   });
+}
+
+/**
+ * 分支鎖的現況（給 `status` 的信封）。
+ *
+ * **鎖的路徑一定要報**：鎖是按倉庫放的（就地模式在 `<倉庫>/.sdd/` 之下，
+ * 克隆模式在外掛根的 `runtime/` 之下），使用者要知道去哪裡看它。
+ */
+function lockReport(lockPath: string): {
+  path: string;
+  running: boolean;
+  taskName?: string;
+  branch?: string;
+  startedAt?: string;
+} {
+  const lock = getLock(lockPath);
+  if (!lock?.running) {
+    return { path: lockPath, running: false };
+  }
+  return {
+    path: lockPath,
+    running: true,
+    taskName: lock.taskName,
+    branch: lock.branch,
+    startedAt: lock.startedAt,
+  };
 }
 
 /** `stop --task <n> [--force]`: release the branch lock, keep everything else. */
@@ -727,7 +769,8 @@ async function cmdMigrate(args: ParsedArgs, opts: RunCliOptions): Promise<number
   }
   if ((result.mixed ?? []).length > 0) {
     notices.push(
-      `有 ${(result.mixed ?? []).length} 條 thread 混了兩個倉庫的 checkpoint，沒有搬（請手動處理）`
+      `有 ${(result.mixed ?? []).length} 條 thread 混了兩種不同的 repoUrl 寫法，` +
+        '沒有搬（請手動處理）'
     );
   }
 
@@ -1073,12 +1116,14 @@ function contextOf(resolved: ResolvedRepo): RunContext {
     // **正規化過的路徑**：鎖檔、run-metadata、回報的 repoPath 必須指向
     // 同一個物理路徑（macOS 的 `/var` 是 `/private/var` 的符號連結）。
     const repoRoot = canonicalRepoRoot(resolved.repoRoot);
+    // **必須是 `defaultSddHome()` 的結果**：`getSddHome()` 原樣返回上下文裡的
+    // 值，自己不套 `SDD_GRAPH_SDD_HOME`——不傳等於那個環境變數失效。
+    const sddHome = defaultSddHome(repoRoot);
+    assertSddHomeSeparate(sddHome, repoRoot);
     return {
       mode: 'local',
       repoRoot,
-      // **必須是 `defaultSddHome()` 的結果**：`getSddHome()` 原樣返回上下文裡的
-      // 值，自己不套 `SDD_GRAPH_SDD_HOME`——不傳等於那個環境變數失效。
-      sddHome: defaultSddHome(repoRoot),
+      sddHome,
       workspaceBase: getWorkspaceBase(),
     };
   }
@@ -1434,7 +1479,12 @@ function syncMirror(values: Record<string, unknown>): void {
   if (requirementName === '' || repoPath === '') return;
 
   try {
-    new ArtifactStore(requirementName, repoPath).sync(values as unknown as SddState);
+    // **就地模式的鏡像不得帶本機絕對路徑**：`workflow-state.json` 要進版本庫，
+    // 寫進去的是每台機器都不一樣的路徑（`repoUrl` 已經用同樣的理由處理過：
+    // 寫遠端地址，寫不出來就寫 `local:<目錄名>`）。鏡像的**位置**還是要用
+    // 真路徑找（`ArtifactStore` 拿它算 docs 目錄），只是文件裡不留路徑。
+    const mirror = isLocalMode() ? { ...values, repoPath: '' } : values;
+    new ArtifactStore(requirementName, repoPath).sync(mirror as unknown as SddState);
   } catch (err) {
     throw new CliError(
       'internal_error',

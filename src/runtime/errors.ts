@@ -11,7 +11,14 @@ export type ErrorCode =
   | 'infra_error'
   | 'cleanup_failed'
   /** 就地模式：工作區有已跟蹤文件的改動，必須由使用者決定怎麼辦。 */
-  | 'dirty_worktree';
+  | 'dirty_worktree'
+  /**
+   * 這個 task 已經跑過了（就地模式：倉庫裡已經有它的運行時狀態）。
+   *
+   * **不是「再試一次就會好」的錯**：重跑不會讓既有的運行時狀態消失，
+   * 使用者得自己決定是繼續（resume）還是重來（reset）。
+   */
+  | 'already_exists';
 
 /**
  * Error categories for recovery strategy selection.
@@ -75,6 +82,10 @@ export function classifyError(errorCode: ErrorCode): ErrorCategory {
     // 再帶走一次，必須由使用者決定（提交、暫存，或留在當前分支上工作）。
     case 'dirty_worktree':
       return 'needs_human';
+    // 「這個 task 已經跑過了」同樣不是重試能解決的：重跑不會讓既有的
+    // 運行時狀態消失，使用者得自己選 resume 或 reset。
+    case 'already_exists':
+      return 'needs_human';
     default:
       return 'needs_human';
   }
@@ -134,6 +145,8 @@ export function createError(
     cleanup_failed: 'Manually remove the task directory and use --force-unlock.',
     dirty_worktree:
       '工作區有未提交的改動：先提交或暫存再重新啟動，或確認留在當前分支上工作。',
+    already_exists:
+      '這個 task 已經跑過了：請用 resume 繼續那一輪，或先 reset 之後再重新啟動。',
   };
 
   return {
@@ -160,4 +173,5 @@ export const ERROR_MESSAGES: Record<ErrorCode, string> = {
   infra_error: 'Infrastructure error',
   cleanup_failed: 'Cleanup operation failed',
   dirty_worktree: '工作區有未提交的改動',
+  already_exists: '這個 task 已經跑過了',
 };

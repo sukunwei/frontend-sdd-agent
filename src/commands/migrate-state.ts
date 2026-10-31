@@ -241,26 +241,28 @@ async function migrateThread(
   // 一起搬走（`repoUrl` 那個 channel 是後寫蓋先寫，誰最後跑誰贏）。
   // 那正是這次改造要修的 bug，遷移工具自己不能犯。
   const repoUrls = repoUrlsOf(tuples);
-  if (repoUrls.size > 1) {
+  if (repoUrls.normalized.size > 1) {
     return {
       kind: 'mixed',
       reason:
-        `這個 thread 混了兩個倉庫的 checkpoint（${[...repoUrls].join('、')}），` +
-        '請手動處理',
+        `這個 thread 出現了兩種不同的 repoUrl 寫法（${repoUrls.originals.join('、')}），` +
+        '它們指向不同的倉庫，請手動處理',
     };
   }
 
-  const repoUrl = repoUrls.size === 1 ? [...repoUrls][0] : undefined;
-  if (opts.matchUrl !== undefined && repoUrl !== opts.matchUrl) {
+  // **比對用正規化後的值**：同一個倉庫的兩種寫法（`git@github.com:x/y.git`
+  // 與 `https://github.com/x/y.git`）是同一個倉庫，不該因為寫法不同就搬不過去。
+  const repoUrl = repoUrls.originals[0];
+  const normalizedRepoUrl =
+    repoUrls.normalized.size === 1 ? [...repoUrls.normalized][0] : undefined;
+  if (opts.matchUrl !== undefined && normalizedRepoUrl !== normalizeRepoUrl(opts.matchUrl)) {
     return {
       kind: 'skipped',
       reason:
         repoUrl === undefined
           ? '讀不到 repoUrl，無法判定歸屬'
           : // **只說「不一致」，不要說「屬於別的倉庫」**：舊庫存的是使用者當初
-            // 敲的 `--repo` 字串（可能是 `git@github.com:x/y.git`），跟
-            // `remote.origin.url` 的寫法不一定一樣——那時這條 thread 未必屬於
-            // 別的倉庫，只是地址寫法不同。
+            // 敲的 `--repo` 字串，跟 `remote.origin.url` 未必一樣。
             `repoUrl 與本倉庫不一致（舊庫的 repoUrl：${repoUrl}）`,
     };
   }
@@ -413,18 +415,70 @@ async function readThreads(saver: SqliteSaver): Promise<Map<string, CheckpointTu
  * 套進 channel 之前寫的，`repoUrl` 還是空的——那不是「另一個倉庫」，
  * 只是還沒寫進去。
  *
+ * **比對用正規化後的值**：見 {@link normalizeRepoUrl}。
+ *
  * @param tuples - 這個 thread 的所有 checkpoint
- * @returns 出現過的非空 repoUrl
+ * @returns 正規化後的寫法（拿來比對）與原始寫法（拿來顯示）
  */
-function repoUrlsOf(tuples: CheckpointTuple[]): Set<string> {
-  const urls = new Set<string>();
+function repoUrlsOf(tuples: CheckpointTuple[]): { normalized: Set<string>; originals: string[] } {
+  const normalized = new Set<string>();
+  const originals: string[] = [];
   for (const tuple of tuples) {
     const values: unknown = tuple.checkpoint.channel_values;
     if (typeof values !== 'object' || values === null) continue;
     const url = (values as Record<string, unknown>).repoUrl;
-    if (typeof url === 'string' && url !== '') urls.add(url);
+    if (typeof url !== 'string' || url === '') continue;
+    normalized.add(normalizeRepoUrl(url));
+    if (!originals.includes(url)) originals.push(url);
   }
-  return urls;
+  return { normalized, originals };
+}
+
+/**
+ * 去掉結尾的 `.git`。
+ */
+function stripGitSuffix(path: string): string {
+  return path.replace(/\.git$/, '');
+}
+
+/**
+ * 把 repoUrl 正規化，讓「同一個倉庫的不同寫法」變成同一個值。
+ *
+ * **為什麼要正規化**：`git@github.com:x/y.git` 與 `https://github.com/x/y.git`
+ * 是同一個倉庫，但字串比對會說它們不同 —— 那會讓一條 thread 被判成
+ * 「混了兩個倉庫」，**一個 checkpoint 都搬不過去**，而且沒有覆寫的出口。
+ *
+ * 做的三件事：
+ * 1. 去掉結尾的 `.git`；
+ * 2. `git@host:path` → `host/path`；
+ * 3. `scheme://host/path` → `host/path`（主機名的大小寫正規化，路徑不動 ——
+ *    某些主機上的路徑是大小寫敏感的）。
+ *
+ * `file://` 與本機路徑不會被拆成 `host/path`（那樣會把兩個不同的本機目錄
+ * 變成同一個值），它們原樣保留 —— 兩者本來就沒有別的寫法可混淆。
+ *
+ * @param url - 使用者寫的 repoUrl
+ */
+export function normalizeRepoUrl(url: string): string {
+  const trimmed = url.trim();
+  if (trimmed === '') return '';
+
+  // scp 語法：git@github.com:x/y.git
+  const scp = /^([^/@\s]+)@([^:/\s]+):(.+)$/.exec(trimmed);
+  if (scp) {
+    return `${scp[2].toLowerCase()}/${stripGitSuffix(scp[3])}`;
+  }
+
+  // URL：https://github.com/x/y.git、ssh://git@github.com/x/y.git
+  const parsed = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/]+)\/(.*)$/.exec(trimmed);
+  if (parsed) {
+    const authority = parsed[2];
+    const at = authority.indexOf('@');
+    const host = at === -1 ? authority : authority.slice(at + 1);
+    return `${host.toLowerCase()}/${stripGitSuffix(parsed[3])}`;
+  }
+
+  return stripGitSuffix(trimmed);
 }
 
 /**

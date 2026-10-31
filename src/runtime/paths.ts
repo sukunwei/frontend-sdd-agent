@@ -91,6 +91,30 @@ export function canonicalRepoRoot(repoRoot: string): string {
 }
 
 /**
+ * 運行時狀態根不得就是業務倉庫根。
+ *
+ * **為什麼是硬限制**：`cleanupTaskWorkspace()` 會刪 `<sddHome>/tasks/<task>`
+ * 與 `<sddHome>/runs/<task>`。`SDD_GRAPH_SDD_HOME` 若被指到倉庫根，
+ * 那兩個名字很可能就是使用者自己的目錄（`tasks/`、`runs/` 是很常見的名字）——
+ * 刪掉的就是使用者正在寫的東西。
+ *
+ * **比較的是正規化過的路徑**：macOS 的 `/var` 與 `/private/var` 是同一個地方。
+ *
+ * @param sddHome - 運行時狀態根
+ * @param repoRoot - 業務倉庫根
+ * @throws Error when the two are the same directory
+ */
+export function assertSddHomeSeparate(sddHome: string, repoRoot: string): void {
+  if (canonicalRepoRoot(sddHome) === canonicalRepoRoot(repoRoot)) {
+    throw new Error(
+      `SDD_GRAPH_SDD_HOME 不得指向業務倉庫根（${repoRoot}）：` +
+        '插件的清理會刪掉 <狀態根>/tasks/<task> 與 <狀態根>/runs/<task>，' +
+        '那很可能就是你自己的目錄。請把它指到別處（例如 <repo>/.sdd）。'
+    );
+  }
+}
+
+/**
  * Requirement documents live INSIDE the cloned repo so they are committed
  * together with the code.
  * Format: <repo-dir>/docs/<requirementName>

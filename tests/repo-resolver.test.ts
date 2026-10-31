@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'child_process';
 import {
   resolveRepo,
   isRemoteSpec,
@@ -32,6 +33,20 @@ describe('倉庫解析', () => {
 
   it('以 .git 結尾也算 remote', () => {
     expect(isRemoteSpec('/tmp/some/repo.git')).toBe(true);
+  });
+
+  it('既存的 .git 目錄是就地工作（目錄名不是判準）', () => {
+    // **目錄名帶 .git 不等於它是遠端**：使用者眼前是一個真的 git 倉庫，
+    // 就地工作才是他想要的（要克隆請改用 file://）。
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-dot-git-'));
+    try {
+      execFileSync('git', ['init', '--initial-branch=main'], { cwd: dir, stdio: 'pipe' });
+      const resolved = resolveRepo(dir, process.cwd());
+      expect(resolved.mode).toBe('local');
+      expect(resolved.repoRoot).toBe(fs.realpathSync(dir));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('file:// 前綴判成 remote，保留「從本地路徑克隆」的舊用法', () => {

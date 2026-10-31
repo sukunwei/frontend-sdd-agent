@@ -3,9 +3,10 @@ import * as path from 'path';
 import { acquireLock, getLock, releaseLock } from '../runtime/branch-lock.js';
 import type { ErrorCode } from '../runtime/errors.js';
 import {
+  applyLocalBranch,
   cloneBranch,
-  isWorktreeDirty,
-  prepareLocalBranch,
+  DIRTY_WORKTREE_MESSAGE,
+  planLocalBranch,
 } from '../runtime/git-branch-manager.js';
 import { isGitRepository } from '../runtime/git-tags.js';
 import {
@@ -59,6 +60,13 @@ export interface StartTaskOptions {
   context?: RunContext;
   /** local 模式且使用者已批准在當前分支工作時為 true */
   skipBranchSwitch?: boolean;
+  /**
+   * 就地模式：沿用既有的那一輪（resume），不當成「已經跑過」的阻擋。
+   *
+   * **只有使用者明確選了 resume 才會是 true**：那一輪的運行時狀態
+   * （run-metadata、runId）要留著，分支歸屬照同一條規則重算一次。
+   */
+  adoptExisting?: boolean;
 }
 
 /**
@@ -165,32 +173,13 @@ export function detectStartBlocker(
  * `prepareLocalBranch()` 會切過去。
  *
  * 髒工作區不在這裡判斷：它是「這一次能不能動手」的狀態，由 `startTask()`
- * 在動手之前自己判斷（見 {@link readWorktreeDirty}）。
+ * 在動手之前自己判斷（見 {@link planLocalBranch}）。
  */
 function detectLocalBlocker(normalizedTaskName: string): StartTaskBlocker | null {
   if (fs.existsSync(getRunMetadataPath(normalizedTaskName))) {
     return { kind: 'already_exists', taskDir: getTaskDir(normalizedTaskName) };
   }
   return null;
-}
-
-/**
- * 工作區有沒有已跟蹤文件的改動。
- *
- * `undefined` = **查不到**（不是 git 倉庫、git 不在 PATH、git 逾時），
- * 不是「乾淨」——回 false 會被誤讀成可以放心切分支，那比報錯更危險。
- *
- * `isWorktreeDirty()` 宣告回傳 boolean 但真的會拋，這是刻意的；
- * 這裡必須接住，否則 `startTask()` 會直接炸出去。
- *
- * @param repoRoot - 倉庫根目錄
- */
-function readWorktreeDirty(repoRoot: string): boolean | undefined {
-  try {
-    return isWorktreeDirty(repoRoot);
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -227,7 +216,9 @@ export async function startTask(
   }
   const normalizedTaskName = validation.normalized;
   const branchName = generateBranchName(normalizedTaskName);
-  const runId = generateRunId();
+  // **沿用既有的那一輪時，runId 要沿用**：那是那一輪的識別碼，
+  // 換一個新的會讓 resume 之後的紀錄對不上前一段。
+  const runId = opts.adoptExisting ? readRunId(normalizedTaskName) : generateRunId();
 
   // 就地模式：程式碼直接寫在使用者的業務倉庫裡，流程整條不一樣。
   if (context.mode === 'local') {
@@ -381,71 +372,62 @@ async function startLocalTask(params: {
       blocker.holderTaskName
     );
   }
-  if (blocker?.kind === 'already_exists') {
+  if (blocker?.kind === 'already_exists' && !opts.adoptExisting) {
     return failure(
       base,
-      `Task "${normalizedTaskName}" already exists in this repository (run metadata or ` +
-        `branch ${branchName} is already there). Use resume or reset first.`,
-      'workspace_error'
+      `Task "${normalizedTaskName}" already exists in this repository (its run metadata ` +
+        'is already there). Use resume or reset first.',
+      'already_exists'
     );
   }
 
-  // Step 3: 工作區髒不髒？已跟蹤文件的改動會被帶到新分支上，
+  // Step 3: 分支歸屬（唯讀的計畫）
+  //
+  // **唯一規則**（見 `planLocalBranch`）：就地模式的一輪 run 屬於
+  // `task/<name>`；使用者明確說「留在當前分支」時才例外，而且那個例外
+  // 必須是記錄下來的決定（`skipBranchSwitch`）。
+  //
+  // 工作區髒不髒也在這裡判：已跟蹤文件的改動會被帶到新分支上，
   // 那是使用者自己正在寫的東西——插件不替他 stash，也不替他帶走。
-  // 查不到狀態（不是 git 倉庫、git 失敗）時擋下來：不知道就不動手。
-  const dirty = readWorktreeDirty(repoRoot);
-  if (dirty === undefined) {
-    return failure(
-      base,
-      `Cannot tell whether the worktree of ${repoRoot} is clean - git status failed. ` +
-        'Nothing was touched.',
-      'git_error'
-    );
+  const plan = planLocalBranch(repoRoot, branchName, {
+    stayOnCurrentBranch: opts.skipBranchSwitch,
+  });
+  if (plan.kind === 'dirty') {
+    return failure(base, DIRTY_WORKTREE_MESSAGE, 'dirty_worktree');
   }
-  if (dirty === true && !opts.skipBranchSwitch) {
-    return failure(
-      base,
-      '工作區有已跟蹤文件的改動，插件不會自動 stash，也不會把這些改動帶到新分支。' +
-        '請先讓使用者確認；若使用者選擇留在當前分支繼續，改用 skipBranchSwitch。',
-      'dirty_worktree'
-    );
+  if (plan.kind === 'failed') {
+    return failure(base, plan.error, plan.errorCode);
   }
 
   // Step 4: take the lock - 與 remote 模式同一套規則
-  const lockOutcome = takeBranchLock(normalizedTaskName, branchName, repoRoot, runId, lockPath);
+  // **鎖裡記的是這一輪真的會在的分支**：留在當前分支時記當前分支，
+  // 記一條沒去過的分支名會誤導後續流程。
+  const plannedBranch = plan.kind === 'stay' ? plan.branch : branchName;
+  const lockOutcome = takeBranchLock(normalizedTaskName, plannedBranch, repoRoot, runId, lockPath);
   if (!lockOutcome.ok) {
     return failure(base, lockOutcome.error, 'lock_conflict', lockOutcome.holderTaskName);
   }
 
-  // Step 5: 準備分支（就地模式的「clone」）
-  // **已存在的 `task/<name>` 分支會被複用**（`prepareLocalBranch()` 切過去），
+  // Step 5: 執行分支歸屬計畫（就地模式的「clone」）
+  // **已存在的 `task/<name>` 分支會被複用**（切過去），
   // 不會另外開一條：reset 之後分支還在，那是同一個 task 的工作分支。
-  const prepared = prepareLocalBranch(repoRoot, branchName, {
-    skipSwitch: opts.skipBranchSwitch,
-  });
-  if (!prepared.ok) {
+  const applied = applyLocalBranch(repoRoot, plan);
+  if (!applied.ok) {
     // 分支沒準備好，鎖要還回去——否則這個倉庫會一直被鎖住。
     const released = releaseLock(lockPath);
-    // 髒不髒看 `dirty`，不看 `errorCode`：`git_error` 被歸類成可自動重試，
-    // 照抄會讓髒工作區被重試策略反反覆複地重試。
-    const primaryError =
-      prepared.dirty === true
-        ? (prepared.error ?? '工作區有未提交的改動')
-        : (prepared.error ?? 'Git operation failed');
-    const primaryCode: ErrorCode =
-      prepared.dirty === true ? 'dirty_worktree' : (prepared.errorCode ?? 'git_error');
     if (!released.success) {
       // 鎖沒還回去：使用者必須知道這個倉庫還被鎖著，
       // 否則他會以為重跑一次就能繼續。
       return failure(
-        { ...base, branch: prepared.branch },
-        `${primaryError}. The branch lock could not be released either ` +
+        base,
+        `${applied.error}. The branch lock could not be released either ` +
           `(${released.error ?? 'unknown error'}) - the lock is still held by this task.`,
-        primaryCode
+        applied.errorCode
       );
     }
-    return failure({ ...base, branch: prepared.branch }, primaryError, primaryCode);
+    return failure(base, applied.error, applied.errorCode);
   }
+  const preparedBranch = applied.branch;
 
   // Step 6: 運行時狀態目錄（只建 .sdd/tasks/<task>，不建 repo/）
   const workspaceResult = initTaskWorkspace(normalizedTaskName);
@@ -464,13 +446,15 @@ async function startLocalTask(params: {
   }
 
   // Step 7: run metadata（寫在 .sdd/runs/<task>/ 之下）
+  // **沿用既有的那一輪時，開始時間不重算**：那是同一輪的開始時間。
+  const adopted = opts.adoptExisting ? readRunMetadata(normalizedTaskName) : undefined;
   writeRunMetadata({
     runId,
     taskName: normalizedTaskName,
-    branch: prepared.branch,
+    branch: preparedBranch,
     repoPath: repoRoot,
     repoUrl,
-    startedAt: new Date().toISOString(),
+    startedAt: adopted?.startedAt ?? new Date().toISOString(),
     status: 'running',
   });
 
@@ -478,7 +462,7 @@ async function startLocalTask(params: {
     success: true,
     taskName: taskNameRaw,
     normalizedTaskName,
-    branch: prepared.branch,
+    branch: preparedBranch,
     repoPath: repoRoot,
     runId,
   };
@@ -612,11 +596,29 @@ function writeRunMetadata(metadata: RunMetadata): void {
  * A task without metadata (an interrupted run) gets a fresh id.
  */
 export function readRunId(normalizedTaskName: string): string {
+  const parsed = readRunMetadata(normalizedTaskName);
+  return parsed?.runId ?? generateRunId();
+}
+
+/**
+ * 既有那一輪的 run-metadata（沒有就回 undefined）。
+ *
+ * **讀不到不是錯**：中斷的 run 沒有 metadata 很正常，那種情況下呼叫端
+ * 會自己補一個新的 runId。
+ */
+function readRunMetadata(
+  normalizedTaskName: string
+): { runId?: string; startedAt?: string } | undefined {
   try {
     const raw = fs.readFileSync(getRunMetadataPath(normalizedTaskName), 'utf-8');
-    const parsed = JSON.parse(raw) as { runId?: unknown };
-    return typeof parsed.runId === 'string' && parsed.runId !== '' ? parsed.runId : generateRunId();
+    const parsed = JSON.parse(raw) as { runId?: unknown; startedAt?: unknown };
+    return {
+      ...(typeof parsed.runId === 'string' && parsed.runId !== '' ? { runId: parsed.runId } : {}),
+      ...(typeof parsed.startedAt === 'string' && parsed.startedAt !== ''
+        ? { startedAt: parsed.startedAt }
+        : {}),
+    };
   } catch {
-    return generateRunId();
+    return undefined;
   }
 }

@@ -41,6 +41,9 @@
 - **遵守 CLAUDE.md**：檔案結構、命名、pattern、import。
 - **一次只做一個 task**：只實作這張工作單指派的 task。
 - **把工作 commit 起來**：實作完成後，在目前的 branch 上 `git add` + `git commit` 你的改動。
+  - **只 commit 你自己寫的檔案**：逐檔 `git add <你寫的檔案>`，**絕對不要 `git add -A`
+    或 `git add .`** —— 就地模式的工作區裡可能還有使用者自己寫到一半的東西，
+    一次全加進來會把它們一起 commit 掉。
   - **克隆模式**：這個 task **第二次**失敗時，圖會用 git 標籤把程式碼 rollback 回 task 的起點 —— 沒有 commit 的改動回不去。
   - **就地模式**：圖**不會 rollback、也不會打 git 標籤**（就地模式沒有回滾點）—— 壞代碼會原樣留在使用者的業務倉庫裡，等人手動收拾。commit 仍然值得做：那是「這一輪做了什麼」的證據。
 - **GREEN 階段不 refactor**：GREEN 是「讓它動」，REFACTOR 才是「讓它對」。

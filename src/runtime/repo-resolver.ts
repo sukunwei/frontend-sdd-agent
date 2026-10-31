@@ -43,14 +43,25 @@ export class RepoResolutionError extends Error {
  * 會把那一路徑克隆一份到外掛的 workspace；現在同一串會被判成 local（就地工作），
  * 那是靜默的行為變更。要保留「從本地路徑克隆」的舊用法，就改寫 `file://` 前綴。
  *
- * **以 `.git` 結尾的路徑同樣算 remote**（git 倉庫常見的檔名形態）。
- * 一個剛好叫 `foo.git` 的本地目錄因此會走 remote 模式——克隆而不是就地工作。
- * 判斷只看字串形態，因為解析器還不知道那個目錄存不存在。
+ * **以 `.git` 結尾的路徑算 remote**，但那只是**字串形態的預判**：
+ * 一個真的存在、而且真的是 git 倉庫的 `foo.git` 目錄仍然是就地工作
+ * （見 {@link resolveRepo}）——使用者眼前是一個真的倉庫，就地工作才是他
+ * 想要的。判斷只看字串形態，因為解析器還不知道那個目錄存不存在。
  *
  * @param spec - 使用者給的 `--repo` 值
  */
 export function isRemoteSpec(spec: string): boolean {
   return spec.includes('://') || spec.startsWith('git@') || spec.endsWith('.git');
+}
+
+/**
+ * 這個字串是 URL 嗎（不是檔案系統路徑）？
+ *
+ * **`file://` 是 URL**：它明確表示「把這份路徑克隆一份」，即使那個路徑
+ * 存在而且是 git 倉庫也不就地工作——那是保留舊用法的出口。
+ */
+function isUrlSpec(spec: string): boolean {
+  return spec.includes('://') || spec.startsWith('git@');
 }
 
 /**
@@ -84,8 +95,10 @@ export function gitTopLevel(dir: string): string | undefined {
  *
  * **判定順序是固定的，不猜**：
  * 1. 缺省 → 用 `cwd`；
- * 2. 命中 URL 形態 → remote（`file://` 也算，見 {@link isRemoteSpec}）；
- * 3. 其餘按路徑處理 → 存在且是 git 倉庫就是 local。
+ * 2. **既存的路徑且是 git 倉庫 → local**（目錄名是不是 `.git` 結尾不影響，
+ *    見 {@link isRemoteSpec}）；
+ * 3. 命中 URL 形態 → remote（`file://` 也算）；
+ * 4. 其餘按路徑處理 → 路徑不存在或不是 git 倉庫就報錯。
  *
  * 路徑寫錯與 URL 寫錯在使用者眼裡是同一件事——「看起來對，其實不對」——
  * 所以路徑不存在時，錯誤訊息把兩種可能都講出來。
@@ -96,12 +109,21 @@ export function gitTopLevel(dir: string): string | undefined {
  */
 export function resolveRepo(spec: string | undefined, cwd: string): ResolvedRepo {
   const raw = spec?.trim() || cwd;
+  const target = path.resolve(cwd, raw);
+
+  // **既存的路徑先當本機路徑**：目錄名叫 `foo.git` 也一樣——使用者眼前是
+  // 一個真的 git 倉庫，就地工作才是他想要的。`file://` 與其他 URL 除外
+  // （那是「克隆一份」的明確指示）。
+  if (!isUrlSpec(raw) && fs.existsSync(target)) {
+    const top = gitTopLevel(target);
+    if (top !== undefined) {
+      return { mode: 'local', repoRoot: fs.realpathSync(top) };
+    }
+  }
 
   if (isRemoteSpec(raw)) {
     return { mode: 'remote', repoRoot: '', remoteUrl: raw };
   }
-
-  const target = path.resolve(cwd, raw);
 
   if (!fs.existsSync(target)) {
     throw new RepoResolutionError(

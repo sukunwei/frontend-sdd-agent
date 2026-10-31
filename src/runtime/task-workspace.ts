@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  assertSddHomeSeparate,
   canonicalRepoRoot,
   getTaskDir,
   getRepoDir,
@@ -161,6 +162,10 @@ function getDirectorySize(dirPath: string): number {
 export function cleanupTaskWorkspace(taskNameNormalized: string): void {
   if (isLocalMode()) {
     const sddHome = getSddHome();
+    // **狀態根不得就是倉庫根**（見 {@link assertSddHomeSeparate}）：
+    // 狀態根就是倉庫根的話，下面刪的 `tasks/<task>` 與 `runs/<task>`
+    // 很可能就是使用者自己的目錄。
+    assertSddHomeSeparate(sddHome, getRunContext().repoRoot);
     const taskDir = getTaskDir(taskNameNormalized);
     const runsDir = path.join(sddHome, 'runs', taskNameNormalized);
     // **驗到各自的父目錄，不只是「在 .sdd 之下」**：`SDD_GRAPH_SDD_HOME`
@@ -193,7 +198,7 @@ export function cleanupTaskWorkspace(taskNameNormalized: string): void {
  * @param target - 要刪除的路徑
  * @throws Error when the target is not strictly under the base
  */
-function assertUnderBase(base: string, target: string): void {
+export function assertUnderBase(base: string, target: string): void {
   const resolvedBase = path.resolve(base);
   const resolvedTarget = path.resolve(target);
   if (!resolvedTarget.startsWith(resolvedBase + path.sep)) {

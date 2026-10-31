@@ -36,7 +36,7 @@ argument-hint: --task <taskName> [--repo <url>]
 ——那是提示不是錯誤，照樣轉達給使用者（插件不改他的 .gitignore）。
 
 LOOP:
-  1. 執行 sdd-graph start --task <taskName> --repo <repoUrl>（<taskName> 與 <repoUrl> 取自本指令的引數）
+  1. 執行 sdd-graph start --task <taskName> [--repo <repoUrl>]（<taskName> 與 <repoUrl> 取自本指令的引數；本指令的引數沒有 --repo 時就不要帶它）
   2. 依退出碼分支：
      - exit 0：階段已完成，向使用者回報，結束
      - exit 2：讀 stdout 的 JSON 信封，依 audience 分支

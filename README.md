@@ -187,8 +187,8 @@ claude plugin list | grep -A 4 sdd-graph
   `discovery.md`、`spec.md`、`e2e-plan.csv`、`tasks.md`、
   `workflow-state.json`、`verify/*.log`，以及實作出來的程式碼與測試。
   **外掛不會替你 commit 或 push** —— 產物留在那條分支上，等你看過再自己提交、合併。
-  （**程式碼由工人 commit 在那條分支上**；`docs/<name>/` 與「要不要合併回你的主分支」
-  由你處理。）
+  （**程式碼由工人 commit 在那條分支上**；`docs/<name>/` **沒有被任何人 commit** ——
+  見下面的「就地模式不做的事」。要不要合併回你的主分支也由你處理。）
 - **在你的 repo 裡**：`.sdd/`（`checkpoints.sqlite` 這一輪的進度、`branch-lock.json`
   這個倉庫的分支鎖）。這是**運行時狀態，建議加進 `.gitignore`**（插件只提示，不代勞）。
 
@@ -240,6 +240,18 @@ claude plugin list | grep -A 4 sdd-graph
 - **不 stash 你的改動**：工作區有**已跟蹤文件**被改過時會停下來問你
   （`dirty_worktree` 閘門）：`proceed` = **留在當前分支上繼續**（外掛不切分支、
   你的改動原封不動），`abort` = 中止這一輪。**未跟蹤的檔案不算髒**，不攔你。
+  ⚠️ 選了 `proceed` 之後，**你未提交的改動會與工人的改動共用同一個工作區**——
+  工人只會 commit 它自己寫的檔案（工作單裡明講了不准 `git add -A`），但那些
+  改動會一起留在你的工作區裡。
+- **不改你的原始碼**：`verification` 階段的 `lint` 閘在就地模式**不帶 `--fix`**
+  （`--fix` 會改寫你的原始碼）。閘門只回報 lint 的問題，改不改由你決定 ——
+  選 `manual` 讓圖回到 TDD 階段讓工人去修，或自己改完再重跑。
+  （克隆模式的那份副本是丟得掉的，那邊照舊自動 `--fix`。）
+- **不 commit `docs/<name>/`**：**沒有任何一個 prompt 會把需求文件 commit 起來** ——
+  工作單的工人只 commit 它自己寫的程式碼與測試。所以 `docs/<name>/`（`prd.md`、
+  `spec.md`、`tasks.md`、`workflow-state.json`、`verify/*.log` …）跑完是**未追蹤的**，
+  要進版本庫得**你自己 `git add docs/<name>/`**（或 `git add -A`，但那會把工作區裡
+  別的東西一起帶進去）。
 - **不刪你的東西**：`reset` 只清 `.sdd/` 底下這個 task 的運行時狀態；
   `docs/<name>/`、分支、程式碼都不動 —— 那些產物要你自己收拾。
 
@@ -333,7 +345,7 @@ bootstrap → prd → spec → e2ePlan → taskSplit → tdd → verification �
 flowchart TD
   START(["start"]) --> BOOT
 
-  BOOT["<b>bootstrap</b> · 確定性<br/>工作區・分支鎖・clone 專案<br/>（clone 只在克隆模式；就地模式直接用你的倉庫，鎖按倉庫）"]
+  BOOT["<b>bootstrap</b> · 確定性<br/>工作分支・分支鎖・clone 專案<br/>（clone 只在克隆模式；就地模式直接用你的倉庫，鎖按倉庫）"]
   BOOT --> PRD
 
   PRD["<b>prd</b> · 先問人<br/>需求由使用者給，不是模型編的"]

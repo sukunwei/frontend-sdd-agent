@@ -139,6 +139,7 @@ describe('CLI 的就地模式（local）', () => {
     vi.restoreAllMocks();
     resetRunContext();
     delete process.env.SDD_GRAPH_WORKSPACE_BASE;
+    delete process.env.SDD_GRAPH_SDD_HOME;
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(ws, { recursive: true, force: true });
   });
@@ -175,6 +176,12 @@ describe('CLI 的就地模式（local）', () => {
     // 沒有遠端就寫目錄名——至少看得出是哪個專案。
     expect(mirror.repoUrl).toBe(`local:${path.basename(repo)}`);
     expect(mirror.repoUrl).not.toContain(os.tmpdir());
+    // **repoPath 也是本機絕對路徑**：那個鏡像要進版本庫，
+    // 寫進去的是每台機器都不一樣的路徑——就地模式一律留空。
+    expect(mirror.repoPath).toBe('');
+    expect(fs.readFileSync(path.join(repo, 'docs', 'local-task', 'workflow-state.json'), 'utf-8')).not.toContain(
+      os.tmpdir()
+    );
   });
 
   it('start 帶 --repo <url> 時走 remote（既有行為不變）', async () => {
@@ -303,6 +310,73 @@ describe('CLI 的就地模式（local）', () => {
     expect(JSON.parse(captured.out).threadId).toBe('local-task');
     expect(currentBranch(repo)).toBe('task/local-task');
     expect(fs.existsSync(path.join(repo, '.sdd', 'checkpoints.sqlite'))).toBe(true);
+  });
+
+  it('SDD_GRAPH_SDD_HOME 指向倉庫根時必須拒絕（清理會刪掉使用者自己的目錄）', async () => {
+    process.env.SDD_GRAPH_SDD_HOME = fs.realpathSync(repo);
+
+    const rc = await runCli(['start', '--task', 'local-task']);
+    const captured = io.take();
+
+    expect(rc).toBe(1);
+    const err = JSON.parse(captured.err) as Envelope;
+    expect(err.code).toBe('validation_error');
+    expect(String(err.message)).toContain('SDD_GRAPH_SDD_HOME');
+    // 使用者的目錄一個字都沒被動到。
+    expect(fs.existsSync(path.join(repo, 'tasks'))).toBe(false);
+  });
+
+  it('status 的信封裡要報得出分支鎖（路徑與誰握著它）', async () => {
+    await runCli(['start', '--task', 'local-task']);
+    io.take();
+
+    const statusRc = await runCli(['status', '--task', 'local-task']);
+    const status = io.take();
+    expect(statusRc).toBe(0);
+
+    const env = JSON.parse(status.out) as Envelope;
+    const lock = env.lock as {
+      path: string;
+      running: boolean;
+      taskName?: string;
+      branch?: string;
+      startedAt?: string;
+    };
+    // **鎖的路徑與內容都要看得到**：使用者要知道「現在是誰握著鎖」。
+    expect(lock.path).toBe(path.join(fs.realpathSync(repo), '.sdd', 'branch-lock.json'));
+    expect(lock.running).toBe(true);
+    expect(lock.taskName).toBe('local-task');
+    expect(lock.branch).toBe('task/local-task');
+    expect(typeof lock.startedAt).toBe('string');
+  });
+
+  it('--repo 指向倉庫裡的子目錄時，仍然是就地工作（同一個倉庫）', async () => {
+    const sub = path.join(repo, 'src', 'deep');
+    fs.mkdirSync(sub, { recursive: true });
+
+    const rc = await runCli(['start', '--task', 'local-task', '--repo', sub]);
+    const captured = io.take();
+
+    expect(rc).toBe(2);
+    expect(captured.err).toBe('');
+    expect(JSON.parse(captured.out).threadId).toBe('local-task');
+    // 子目錄解析回倉庫根：就地模式在**你的倉庫**裡幹活。
+    expect(currentBranch(repo)).toBe('task/local-task');
+    expect(fs.existsSync(path.join(repo, '.sdd', 'checkpoints.sqlite'))).toBe(true);
+  });
+
+  it('stop --force 對壞掉的鎖檔也要能清掉（不能報錯卡住）', async () => {
+    const lockFile = path.join(repo, '.sdd', 'branch-lock.json');
+    fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+    // 壞掉的鎖檔（寫到一半斷電）：沒有人握著它，但它擋著下一輪 run。
+    fs.writeFileSync(lockFile, '{ this is not json', 'utf-8');
+
+    const rc = await runCli(['stop', '--task', 'local-task', '--force']);
+    const captured = io.take();
+
+    expect(rc).toBe(0);
+    expect(captured.err).toBe('');
+    expect(fs.existsSync(lockFile)).toBe(false);
   });
 
   it('origin url 是本機路徑時，鏡像裡不得出現那個絕對路徑', async () => {

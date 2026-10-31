@@ -184,7 +184,13 @@ describe('local 模式的 startTask', () => {
 
     const second = await startTask('local-task', 'ignored');
     expect(second.success).toBe(false);
-    expect(second.errorCode).toBe('workspace_error');
+    // **錯誤碼要說「這個 task 已經跑過了」**：不是「工作區建不起來」
+    // （那是可重試的錯，重跑不會讓既有的運行時狀態消失）。
+    expect(second.errorCode).toBe('already_exists');
+    // **訊息不得指向分支**：分支存在本來就不是阻擋（reset 不刪分支），
+    // 使用者照著訊息去查分支只會白查一場。
+    expect(second.error).not.toContain('branch');
+    expect(second.error).toContain('run metadata');
   });
 
   it('只有分支存在（reset 之後）時不阻塞——分支會被複用', async () => {
@@ -247,6 +253,25 @@ describe('local 模式的 startTask', () => {
 
     expect(() => cleanupTaskWorkspace('.')).toThrow();
     expect(fs.existsSync(path.join(repo, '.sdd', 'tasks', 'other-task'))).toBe(true);
+  });
+
+  it('狀態根被指到倉庫根時，清理必須拒絕刪（那是使用者自己的目錄）', () => {
+    // 使用者自己的目錄：`tasks/` 與 `runs/` 是很常見的名字。
+    const own = path.join(repo, 'tasks', 'my-own');
+    fs.mkdirSync(own, { recursive: true });
+    fs.writeFileSync(path.join(own, 'keep.txt'), 'keep');
+
+    // SDD_GRAPH_SDD_HOME 被指到倉庫根（用戶自己設定的）。
+    setRunContext({
+      mode: 'local',
+      repoRoot: repo,
+      sddHome: repo,
+      workspaceBase: ws,
+    });
+
+    expect(() => cleanupTaskWorkspace('my-own')).toThrow();
+    // **使用者的目錄一個字都沒被動到。**
+    expect(fs.existsSync(path.join(own, 'keep.txt'))).toBe(true);
   });
 
   it('local 模式列舉既有 task 時看 .sdd/tasks', async () => {

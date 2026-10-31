@@ -467,52 +467,107 @@ export function prepareLocalBranch(
 }
 
 /**
- * Get git status for a repo.
+ * 就地模式的分支歸屬計畫（唯讀）。
+ *
+ * - `switch`：切到 `task/<name>`（就地模式的一輪 run 屬於那條分支）；
+ * - `stay`：使用者明確選擇留在當前分支（`proceed` 的意思）；
+ * - `dirty`：工作區有已跟蹤文件的改動 —— 要問使用者，不能替他決定；
+ * - `failed`：連工作區狀態都查不到（或 git 失敗）。
  */
-export function getGitStatus(repoDir: string): {
-  isClean: boolean;
-  currentBranch: string | null;
-  hasChanges: boolean;
-  stagedChanges: number;
-  unstagedChanges: number;
-} {
+export type LocalBranchPlan =
+  | { kind: 'switch'; taskBranch: string }
+  | { kind: 'stay'; branch: string }
+  | { kind: 'dirty' }
+  | { kind: 'failed'; error: string; errorCode: ErrorCode };
+
+/** 髒工作區的共用訊息（就地模式只有這一句）。 */
+export const DIRTY_WORKTREE_MESSAGE =
+  '工作區有已跟蹤文件的改動，插件不會自動 stash，也不會把這些改動帶到新分支。' +
+  '請先讓使用者確認要不要留在當前分支上工作。';
+
+/**
+ * 算就地模式的分支歸屬（唯讀，不動任何東西）。
+ *
+ * **這是「分支歸屬」的唯一規則**：就地模式的一輪 run 屬於 `task/<name>`；
+ * 唯一的例外是使用者明確說「留在當前分支」（髒工作區閘門的 `proceed`），
+ * 而且那個例外必須是**記錄下來的決定**，不是默默沿用使用者現在的分支。
+ *
+ * **先算計畫、後動手**：計畫是唯讀的（可以放進閘門之前），
+ * 真正切分支是 {@link applyLocalBranch} 的事 —— 那時鎖已經拿到了。
+ *
+ * @param repoRoot - 使用者業務倉庫的根目錄
+ * @param taskBranch - 目標分支名（`task/<name>`）
+ * @param opts - `stayOnCurrentBranch: true` 表示使用者已選擇留在當前分支
+ */
+export function planLocalBranch(
+  repoRoot: string,
+  taskBranch: string,
+  opts: { stayOnCurrentBranch?: boolean } = {}
+): LocalBranchPlan {
+  // **使用者已經明確決定留在當前分支**：不切、也不問。
+  if (opts.stayOnCurrentBranch) {
+    return { kind: 'stay', branch: currentBranchName(repoRoot) };
+  }
+
+  let dirty: boolean;
   try {
-    const status = execFileSync('git', ['-C', repoDir, 'status', '--porcelain'], {
-      encoding: 'utf-8',
-      timeout: 5000,
-    });
-
-    const lines = status.trim().split('\n').filter(Boolean);
-    let stagedCount = 0;
-    let unstagedCount = 0;
-
-    for (const line of lines) {
-      if (line.startsWith('??') || line.startsWith('!!')) {
-        // Untracked - consider unstaged
-        unstagedCount++;
-      } else if (line[1] === ' ') {
-        // Staged change
-        stagedCount++;
-      } else {
-        // Unstaged change
-        unstagedCount++;
-      }
-    }
-
+    dirty = isWorktreeDirty(repoRoot);
+  } catch (err) {
+    // **不知道就說不知道**：回 false 會被讀成「乾淨」，那比報錯更危險。
     return {
-      isClean: lines.length === 0,
-      currentBranch: getCurrentBranch(repoDir),
-      hasChanges: lines.length > 0,
-      stagedChanges: stagedCount,
-      unstagedChanges: unstagedCount,
-    };
-  } catch {
-    return {
-      isClean: false,
-      currentBranch: null,
-      hasChanges: false,
-      stagedChanges: 0,
-      unstagedChanges: 0,
+      kind: 'failed',
+      error: isTimeoutError(err)
+        ? `無法判斷工作區狀態：git status 逾時（${GIT_READ_TIMEOUT_MS / 1000} 秒後被中止）。`
+        : `無法判斷工作區狀態：${gitErrorText(err)}`,
+      errorCode: 'git_error',
     };
   }
+
+  // 髒工作區：使用者正在寫的東西會被帶到新分支上，必須由使用者決定。
+  if (dirty) {
+    return { kind: 'dirty' };
+  }
+
+  return { kind: 'switch', taskBranch };
 }
+
+/**
+ * 執行分支歸屬計畫（寫入：切分支）。
+ *
+ * **切分支是寫操作**：它改變使用者的倉庫狀態，所以只能在計畫之後、
+ * 鎖拿到之後做。計畫與執行分開，是為了讓「要不要問使用者」這個判斷
+ * 發生在任何寫入之前。
+ *
+ * @param repoRoot - 使用者業務倉庫的根目錄
+ * @param plan - {@link planLocalBranch} 算出的計畫
+ */
+export function applyLocalBranch(
+  repoRoot: string,
+  plan: LocalBranchPlan
+): { ok: true; branch: string } | { ok: false; error: string; errorCode: ErrorCode } {
+  if (plan.kind === 'stay') {
+    return { ok: true, branch: plan.branch };
+  }
+  if (plan.kind === 'dirty') {
+    return { ok: false, error: DIRTY_WORKTREE_MESSAGE, errorCode: 'dirty_worktree' };
+  }
+  if (plan.kind === 'failed') {
+    return { ok: false, error: plan.error, errorCode: plan.errorCode };
+  }
+
+  const prepared = prepareLocalBranch(repoRoot, plan.taskBranch);
+  if (prepared.ok) {
+    return { ok: true, branch: prepared.branch };
+  }
+  // 計畫與執行之間工作區變髒了（使用者正好在這時候改檔案）：
+  // 一樣要問使用者，不能自己把改動帶到新分支上。
+  if (prepared.dirty === true) {
+    return { ok: false, error: DIRTY_WORKTREE_MESSAGE, errorCode: 'dirty_worktree' };
+  }
+  return {
+    ok: false,
+    error: prepared.error ?? 'Git operation failed',
+    errorCode: prepared.errorCode ?? 'git_error',
+  };
+}
+

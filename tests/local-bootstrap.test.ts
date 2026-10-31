@@ -341,6 +341,54 @@ describe('就地模式的 bootstrap 節點', () => {
     expect(currentBranch(repo)).toBe('task/local-task');
   });
 
+  it('already_exists 答 resume 之後落在 task/<name> 分支（不是使用者現在的分支）', async () => {
+    // 這個 task 之前跑過：留下 run-metadata，下一次跑就會撞上 already_exists
+    const first = localGraph('run-1');
+    await first.g.invoke(inputOf({ requirementName: 'local-task', repoUrl: 'ignored' }), first.cfg);
+    expect(valuesOf(await first.g.getState(first.cfg)).bootstrapped).toBe(true);
+
+    // 使用者自己回到 main（他在主分支上繼續寫東西）
+    execFileSync('git', ['-C', repo, 'checkout', 'main'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // 第二輪：撞上 already_exists 閘門 → 答 resume
+    const second = localGraph('run-2');
+    await second.g.invoke(inputOf({ requirementName: 'local-task', repoUrl: 'ignored' }), second.cfg);
+    expect(pendingTypes(await second.g.getState(second.cfg))).toContain('already_exists');
+
+    await second.g.invoke(new Command({ resume: { action: 'resume' } }), second.cfg);
+
+    const snap = await second.g.getState(second.cfg);
+    // **分支歸屬的規則**：一輪 run 屬於 task/<name>，不是「使用者現在這條分支」。
+    expect(valuesOf(snap).bootstrapped).toBe(true);
+    expect(valuesOf(snap).branch).toBe('task/local-task');
+    expect(currentBranch(repo)).toBe('task/local-task');
+  });
+
+  it('already_exists 答 resume 之後，工作區髒時要走髒工作區閘門（不得默默切分支）', async () => {
+    const first = localGraph('run-1');
+    await first.g.invoke(inputOf({ requirementName: 'local-task', repoUrl: 'ignored' }), first.cfg);
+
+    execFileSync('git', ['-C', repo, 'checkout', 'main'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // 使用者自己正在寫東西
+    dirtyTheWorktree();
+
+    const second = localGraph('run-2');
+    await second.g.invoke(inputOf({ requirementName: 'local-task', repoUrl: 'ignored' }), second.cfg);
+    await second.g.invoke(new Command({ resume: { action: 'resume' } }), second.cfg);
+
+    const snap = await second.g.getState(second.cfg);
+    // **髒工作區要問使用者**：不得默默切分支把使用者的改動帶走。
+    expect(pendingTypes(snap)).toContain('dirty_worktree');
+    expect(currentBranch(repo)).toBe('main');
+    expect(fs.readFileSync(path.join(repo, 'a.txt'), 'utf-8')).toBe('changed by the user\n');
+  });
+
   it('工作區乾淨時就地模式直接開跑，不開髒工作區閘門', async () => {
     const { g, cfg } = localGraph('local-task');
     await g.invoke(inputOf({ requirementName: 'local-task', repoUrl: 'ignored' }), cfg);

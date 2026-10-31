@@ -12,10 +12,15 @@ import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.j
 import { acquireLock, forceUnlock, getLock, releaseLock } from '../runtime/branch-lock.js';
 import { SddAbortError } from '../runtime/errors.js';
 import { currentBranchName } from '../runtime/git-branch-manager.js';
-import { canonicalRepoRoot, getLockFilePath, getRepoDir } from '../runtime/paths.js';
+import {
+  canonicalRepoRoot,
+  getLockFilePath,
+  getRepoDir,
+  getSddHome,
+} from '../runtime/paths.js';
 import { getRunContext, isLocalMode } from '../runtime/run-context.js';
 import { generateBranchName, normalizeTaskName } from '../runtime/task-name.js';
-import { cleanupTaskWorkspace } from '../runtime/task-workspace.js';
+import { assertUnderBase, cleanupTaskWorkspace } from '../runtime/task-workspace.js';
 
 /**
  * The bootstrap node: the deterministic setup of a run.
@@ -62,6 +67,15 @@ const STAGE = 'bootstrap';
  */
 const STEP_DIRTY_WORKTREE = 'dirty-worktree';
 
+/**
+ * The ledger step that remembers that the user chose to resume an existing run.
+ *
+ * **為什麼要記在台賬裡**：`already_exists` 閘門問過一次之後，下一個執行
+ * 不得再問一次——一次執行只能問一次（第二次的 `interrupt()` 會吃掉使用者
+ * 下一個答案而不是停下來），而且使用者已經答過了就不該被重複問。
+ */
+const STEP_ADOPT_EXISTING = 'adopt-existing';
+
 /** Options of {@link bootstrapNode}. */
 export interface BootstrapOptions {
   /** Branch lock file. Defaults to the plugin-root lock. */
@@ -91,6 +105,8 @@ export async function bootstrapNode(
   // （`stageSteps` 的 reducer 是合併語義，合併刪不掉一個鍵），
   // 那個鍵還在，但意思是「這一步沒發生過」。
   let dirtyApproved = readStageStep(state, STAGE, STEP_DIRTY_WORKTREE) === 'proceed';
+  // **使用者已經選過「沿用既有的那一輪」**：這是記錄下來的決定，不是預設。
+  let adopted = readStageStep(state, STAGE, STEP_ADOPT_EXISTING) === 'resume';
 
   // Has this execution already asked the user something?
   let asked = false;
@@ -119,7 +135,10 @@ export async function bootstrapNode(
   // ---- Step 1: does the user have to decide anything? -------------------
   // Read-only: the checks below touch neither the lock nor the workspace.
   const blocker = detectStartBlocker(normalizedTaskName, lockPath);
-  if (blocker) {
+  // **使用者已經答過「沿用既有的那一輪」就不得再問一次**：一次執行只能問
+  // 一次（再問一次會把使用者接下來的答案吃掉），而且使用者已經答過了。
+  const blockerAnswered = blocker?.kind === 'already_exists' && local && adopted;
+  if (blocker && !blockerAnswered) {
     const action = actionOf(interrupt(payloadFor(blocker)));
     asked = true;
 
@@ -151,14 +170,32 @@ export async function bootstrapNode(
           ...(recordStageStep(STAGE, STEP_DIRTY_WORKTREE, '').stageSteps ?? {}),
         };
       }
-    } else if (repoIsCloned(normalizedTaskName)) {
-      // 'resume': keep the workspace the previous run prepared.
-      return finish(adoptWorkspace(normalizedTaskName, branch, lockPath));
+      // **「沿用既有的那一輪」也要清**：reset 的本意是「從頭再來」，
+      // 沿用「沿用既有那一輪」的決定就不是從頭再來了。
+      if (hasStageStep(state, STAGE, STEP_ADOPT_EXISTING)) {
+        adopted = false;
+        pendingSteps = {
+          ...pendingSteps,
+          ...(recordStageStep(STAGE, STEP_ADOPT_EXISTING, '').stageSteps ?? {}),
+        };
+      }
     } else if (local) {
+      // 就地模式的 'resume'：**記下使用者的選擇，然後由 `startTask()` 統一
+      // 處理分支歸屬**——就地模式的一輪 run 屬於 `task/<name>`，不是
+      // 「使用者現在站的那條分支」。
+      //
       // 就地模式沒有「clone 了一半的倉庫」：那個空殼本來就不存在。
       // 刪它只是為了清掉舊版本可能留下的殼——刪不掉也不該讓這輪 run 死在這裡，
       // 裡面沒有使用者的任何東西。
       removeRepoShell(normalizedTaskName);
+      adopted = true;
+      pendingSteps = {
+        ...pendingSteps,
+        ...(recordStageStep(STAGE, STEP_ADOPT_EXISTING, 'resume').stageSteps ?? {}),
+      };
+    } else if (repoIsCloned(normalizedTaskName)) {
+      // 'resume': keep the workspace the previous run prepared.
+      return finish(adoptWorkspace(normalizedTaskName, branch, lockPath));
     } else {
       // 'resume', but the previous run never finished its clone: the repo
       // directory is an empty shell. Only that shell is thrown away - the
@@ -175,6 +212,9 @@ export async function bootstrapNode(
       // **使用者已經批准留在當前分支上工作**：不切分支，工作區是髒的也照跑。
       // 這是 `proceed` 的全部意思——使用者的改動原封不動地留在原地。
       ...(local && dirtyApproved ? { skipBranchSwitch: true } : {}),
+      // **就地模式的 resume**：沿用既有的那一輪（run-id 與運行時狀態留著），
+      // 分支歸屬照同一條規則重算——不是「使用者現在站的那條分支」。
+      ...(local && adopted ? { adoptExisting: true } : {}),
     });
     if (result.success) {
       return finish(advance(result));
@@ -287,9 +327,10 @@ function adoptWorkspace(
 ): NodeOutcome {
   const repoPath = repoPathOf(normalizedTaskName);
   const runId = readRunId(normalizedTaskName);
-  // **就地模式的分支不是插件自己開的那條**：使用者可能選了「留在當前分支
-  // 幹活」，所以要記「真的所在」的分支，後面的流程才知道自己在哪裡。
-  const effectiveBranch = isLocalMode() ? currentBranchName(repoPath) : branch;
+  // **就地模式不走這條路**：就地模式的 resume 由 `startTask()` 處理，
+  // 分支歸屬照同一條規則重算（見 `planLocalBranch`）。這裡是克隆模式專用：
+  // 沿用上一輪準備好的工作區，分支就是那一輪的分支。
+  const effectiveBranch = branch;
 
   const lock = getLock(lockPath);
   if (!lock?.running) {
@@ -394,7 +435,9 @@ function dirtyWorktreePayload(normalizedTaskName: string): InterruptPayload {
     message:
       `${repoPath} 的工作區有已跟蹤文件的改動，插件不會自動 stash，` +
       '也不會把這些改動帶到新分支。' +
-      `選 proceed：留在當前分支（${branch}）上工作，使用者的改動原封不動；` +
+      `選 proceed：留在當前分支（${branch}）上工作。` +
+      '**你的未提交改動會與工作單工人的改動共用同一個工作區**——' +
+      '工人只會提交它自己寫的那些檔案，但那些改動會一起留在你的工作區裡；' +
       '選 abort：中止這輪運行。',
   };
 }
@@ -490,8 +533,12 @@ function cleanupWorkspace(normalizedTaskName: string): void {
  * 那個目錄裡沒有使用者的任何東西。
  */
 function removeRepoShell(normalizedTaskName: string): void {
+  const target = getRepoDir(normalizedTaskName);
   try {
-    fs.rmSync(getRepoDir(normalizedTaskName), { recursive: true, force: true });
+    // **刪之前先驗證目標確實在該根目錄之下**（與 `cleanupTaskWorkspace()`
+    // 同一道閘）：刪錯就是使用者的程式碼沒了。
+    assertUnderBase(path.join(getSddHome(), 'tasks'), target);
+    fs.rmSync(target, { recursive: true, force: true });
   } catch (err) {
     console.warn('Failed to remove the empty repo shell:', err);
   }
