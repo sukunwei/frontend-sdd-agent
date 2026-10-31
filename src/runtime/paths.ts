@@ -1,61 +1,65 @@
-import * as fs from 'fs';
-import * as path from 'path';
-import { fileURLToPath } from 'url';
-
 /**
  * Single source of truth for every filesystem path in the plugin.
  *
- * The plugin root is found by walking UP from this module's own location until
- * a directory containing `.claude-plugin/plugin.json` shows up. That is
- * layout-independent: it works whether the code runs from `src/runtime/`
- * (tsx) or from `dist/src/runtime/` (compiled), which a fixed
- * `path.resolve(__dirname, '../../..')` does not.
+ * Every path is resolved from the current run context (`run-context.ts`): in
+ * local mode the plugin works inside the user's business repository and the
+ * runtime state lives under `<repoRoot>/.sdd`; in remote mode everything falls
+ * back to the plugin root, which is the behaviour that existed before the
+ * local mode was introduced.
+ *
+ * The plugin root lookup lives in `plugin-root.ts` so that this module and
+ * `run-context.ts` can both use it without importing each other.
  */
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+import * as fs from 'fs';
+import * as path from 'path';
+import { getPluginRoot } from './plugin-root.js';
+import { getRunContext, isLocalMode } from './run-context.js';
 
-const MAX_PARENT_WALK = 6;
-
-/**
- * Resolve the plugin root (the directory holding `.claude-plugin/plugin.json`).
- * @throws Error if no ancestor directory contains the plugin manifest.
- */
-export function getPluginRoot(): string {
-  let dir = HERE;
-  for (let i = 0; i < MAX_PARENT_WALK; i += 1) {
-    if (fs.existsSync(path.join(dir, '.claude-plugin', 'plugin.json'))) {
-      return dir;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  throw new Error('plugin root not found');
-}
+/** Plugin root - re-exported so callers keep a single import site. */
+export { getPluginRoot };
 
 /**
  * Base directory holding one sub-directory per task workspace.
  * Override with SDD_GRAPH_WORKSPACE_BASE (tests point this at a temp dir).
  * The override is resolved to an absolute path so every derived work-order
  * path stays absolute even when the variable holds a relative value.
+ *
+ * In local mode the workspace base is not used for task directories - the
+ * task directories live under the run context's `.sdd` root instead.
  */
 export function getWorkspaceBase(): string {
   const override = process.env.SDD_GRAPH_WORKSPACE_BASE;
   if (override) {
     return path.resolve(override);
   }
-  return path.join(getPluginRoot(), 'workspace', 'tasks');
+  return getRunContext().workspaceBase;
+}
+
+/**
+ * Runtime state root of the current run.
+ * Format: local → <sdd-home>; remote → <plugin-root>/runtime
+ */
+export function getSddHome(): string {
+  return getRunContext().sddHome;
 }
 
 /**
  * Task workspace directory.
- * Format: <workspace-base>/<taskName>
+ * Format: local → <sdd-home>/tasks/<taskName>; remote → <workspace-base>/<taskName>
+ *
+ * In local mode the directory MUST stay under the `.sdd` root: the task
+ * workspace is deleted recursively on rollback, and pointing it at the user's
+ * business repository would delete the user's own code.
  */
 export function getTaskDir(taskName: string): string {
+  if (isLocalMode()) {
+    return path.join(getSddHome(), 'tasks', taskName);
+  }
   return path.join(getWorkspaceBase(), taskName);
 }
 
 /**
- * Cloned repository directory.
+ * Repository directory of a task.
  * Format: <task-dir>/repo
  */
 export function getRepoDir(taskName: string): string {
@@ -92,31 +96,43 @@ export function getVerifyLogDir(requirementName: string, repoDir?: string): stri
 
 /**
  * Global branch runtime lock file.
- * Format: <plugin-root>/runtime/branch-runtime-lock.json
+ * Format: local → <sdd-home>/branch-lock.json; remote → <plugin-root>/runtime/branch-runtime-lock.json
  *
- * The path is **not** configurable through the environment: the lock is
- * global, and an environment variable that silently points it somewhere else
- * would let two runs use two different locks. Callers that need another file
- * (the tests) pass it explicitly - `buildGraph({ lockPath })` and the
- * `lockPath` option of the lock functions.
+ * In remote mode the path is **not** configurable through the environment:
+ * the lock is global, and an environment variable that silently points it
+ * somewhere else would let two runs use two different locks. Callers that
+ * need another file (the tests) pass it explicitly - `buildGraph({ lockPath })`
+ * and the `lockPath` option of the lock functions.
+ *
+ * In local mode the lock lives under the run context's `.sdd` root so that
+ * two repositories do not lock each other out.
  */
 export function getLockFilePath(): string {
+  if (isLocalMode()) {
+    return path.join(getSddHome(), 'branch-lock.json');
+  }
   return path.join(getPluginRoot(), 'runtime', 'branch-runtime-lock.json');
 }
 
 /**
  * LangGraph checkpoint database.
- * Format: <plugin-root>/runtime/checkpoints.sqlite
+ * Format: local → <sdd-home>/checkpoints.sqlite; remote → <plugin-root>/runtime/checkpoints.sqlite
  */
 export function getCheckpointPath(): string {
+  if (isLocalMode()) {
+    return path.join(getSddHome(), 'checkpoints.sqlite');
+  }
   return path.join(getPluginRoot(), 'runtime', 'checkpoints.sqlite');
 }
 
 /**
  * Run metadata file.
- * Format: <task-dir>/run-metadata.json
+ * Format: local → <sdd-home>/runs/<taskName>/run-metadata.json; remote → <task-dir>/run-metadata.json
  */
 export function getRunMetadataPath(taskName: string): string {
+  if (isLocalMode()) {
+    return path.join(getSddHome(), 'runs', taskName, 'run-metadata.json');
+  }
   return path.join(getTaskDir(taskName), 'run-metadata.json');
 }
 
