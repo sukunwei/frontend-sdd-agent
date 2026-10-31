@@ -12,8 +12,10 @@ import {
   getLockFilePath,
   getRunMetadataPath,
   getPluginRoot,
+  getSddHome,
   getTaskDir,
   getRepoDir,
+  getWorkspaceBase,
 } from '../src/runtime/paths.js';
 
 afterEach(() => {
@@ -31,6 +33,7 @@ describe('運行上下文', () => {
 
   it('設置 local 上下文後 checkpoint 與 lock 落在 .sdd 之下', () => {
     setRunContext({ mode: 'local', repoRoot: '/tmp/repo', sddHome: '/tmp/repo/.sdd', workspaceBase: '/tmp/ws' });
+    expect(getSddHome()).toBe('/tmp/repo/.sdd');
     expect(getCheckpointPath()).toBe('/tmp/repo/.sdd/checkpoints.sqlite');
     expect(getLockFilePath()).toBe('/tmp/repo/.sdd/branch-lock.json');
     expect(getRunMetadataPath('t1')).toBe('/tmp/repo/.sdd/runs/t1/run-metadata.json');
@@ -44,12 +47,19 @@ describe('運行上下文', () => {
     expect(defaultSddHome('/tmp/repo')).toBe(path.join('/tmp/repo', '.sdd'));
   });
 
+  it('defaultSddHome 的衍生路徑一律是絕對路徑', () => {
+    expect(defaultSddHome('.')).toBe(path.resolve('.sdd'));
+    expect(path.isAbsolute(defaultSddHome('.'))).toBe(true);
+  });
+
   it('local 模式下 task 與 repo 目錄必須留在 .sdd 之下（清理函式會遞迴刪除）', () => {
     setRunContext({ mode: 'local', repoRoot: '/tmp/repo', sddHome: '/tmp/repo/.sdd', workspaceBase: '/tmp/ws' });
     expect(getTaskDir('t1')).toBe('/tmp/repo/.sdd/tasks/t1');
     expect(getRepoDir('t1')).toBe('/tmp/repo/.sdd/tasks/t1/repo');
-    // 絕不能落在業務倉庫裡——getRepoDir 是遞迴刪除的目標，只能在 .sdd 之下
-    expect(getRepoDir('t1').startsWith('/tmp/repo/.sdd/')).toBe(true);
-    expect(getRepoDir('t1')).not.toBe('/tmp/repo/repo');
+  });
+
+  it('workspace base 與運行上下文無關（remote 語義固定在插件根）', () => {
+    setRunContext({ mode: 'local', repoRoot: '/tmp/repo', sddHome: '/tmp/repo/.sdd', workspaceBase: '/tmp/ws' });
+    expect(getWorkspaceBase()).toBe(`${getPluginRoot()}/workspace/tasks`);
   });
 });

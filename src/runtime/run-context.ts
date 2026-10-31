@@ -28,6 +28,15 @@ export interface RunContext {
 let current: RunContext | undefined;
 
 /**
+ * 預設上下文的快取。
+ *
+ * 插件根的查找會向上遍歷檔案系統，而每個路徑函式都會問一次「現在是不是
+ * 就地模式」，所以預設上下文必須記住；但又不能在模組載入時就算——插件根
+ * 找不到時 `getPluginRoot()` 會拋錯，載入期拋錯會讓整個插件連啟動都失敗。
+ */
+let fallback: RunContext | undefined;
+
+/**
  * 設置這一次運行的上下文。
  *
  * 這是全進程唯一的上下文：節點拿不到 CLI 的參數，卻又要知道自己在
@@ -42,13 +51,16 @@ export function setRunContext(ctx: RunContext): void {
  */
 export function getRunContext(): RunContext {
   if (current) return current;
-  const pluginRoot = getPluginRoot();
-  return {
-    mode: 'remote',
-    repoRoot: pluginRoot,
-    sddHome: path.join(pluginRoot, 'runtime'),
-    workspaceBase: path.join(pluginRoot, 'workspace', 'tasks'),
-  };
+  if (!fallback) {
+    const pluginRoot = getPluginRoot();
+    fallback = {
+      mode: 'remote',
+      repoRoot: pluginRoot,
+      sddHome: path.join(pluginRoot, 'runtime'),
+      workspaceBase: path.join(pluginRoot, 'workspace', 'tasks'),
+    };
+  }
+  return fallback;
 }
 
 /**
@@ -69,12 +81,12 @@ export function isLocalMode(): boolean {
  * 推導某個倉庫的運行時狀態根。
  *
  * `SDD_GRAPH_SDD_HOME` 可覆寫（例如把狀態放在磁碟之外或共用一份），
- * 覆寫值一律解析成絕對路徑，衍生路徑才不會隨 cwd 漂移。
+ * 兩個分支都解析成絕對路徑，衍生路徑才不會隨 cwd 漂移。
  *
  * @param repoRoot - 業務倉庫根
  */
 export function defaultSddHome(repoRoot: string): string {
   const override = process.env.SDD_GRAPH_SDD_HOME;
   if (override) return path.resolve(override);
-  return path.join(repoRoot, '.sdd');
+  return path.resolve(repoRoot, '.sdd');
 }

@@ -1,11 +1,13 @@
 /**
  * Single source of truth for every filesystem path in the plugin.
  *
- * Every path is resolved from the current run context (`run-context.ts`): in
- * local mode the plugin works inside the user's business repository and the
- * runtime state lives under `<repoRoot>/.sdd`; in remote mode everything falls
- * back to the plugin root, which is the behaviour that existed before the
- * local mode was introduced.
+ * The run-context-dependent paths (task dir, checkpoint, lock, run metadata)
+ * are resolved from the current run context (`run-context.ts`): in local mode
+ * the plugin works inside the user's business repository and the runtime state
+ * lives under `<repoRoot>/.sdd`; in remote mode everything falls back to the
+ * plugin root, which is the behaviour that existed before the local mode was
+ * introduced. `getWorkspaceBase()` stays context-independent - it always means
+ * "the remote-mode task workspace parent".
  *
  * The plugin root lookup lives in `plugin-root.ts` so that this module and
  * `run-context.ts` can both use it without importing each other.
@@ -24,15 +26,18 @@ export { getPluginRoot };
  * The override is resolved to an absolute path so every derived work-order
  * path stays absolute even when the variable holds a relative value.
  *
- * In local mode the workspace base is not used for task directories - the
- * task directories live under the run context's `.sdd` root instead.
+ * This function is deliberately **independent of the run context**: it means
+ * "where the remote-mode task workspaces live", and `getWorkspaceInfo()`
+ * enumerates it as such. In local mode the task directories live under the
+ * run context's `.sdd` root instead, and `getTaskDir()` resolves them there
+ * without going through this function.
  */
 export function getWorkspaceBase(): string {
   const override = process.env.SDD_GRAPH_WORKSPACE_BASE;
   if (override) {
     return path.resolve(override);
   }
-  return getRunContext().workspaceBase;
+  return path.join(getPluginRoot(), 'workspace', 'tasks');
 }
 
 /**
