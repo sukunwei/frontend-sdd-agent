@@ -7,11 +7,15 @@ import {
   startTask,
 } from '../commands/start-task.js';
 import type { StartTaskBlocker, StartTaskResult } from '../commands/start-task.js';
-import { acquireLock, forceUnlock, getLock } from '../runtime/branch-lock.js';
-import { getLockFilePath, getRepoDir } from '../runtime/paths.js';
+import { hasStageStep, recordStageStep } from '../graph/state.js';
+import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.js';
+import { acquireLock, forceUnlock, getLock, releaseLock } from '../runtime/branch-lock.js';
+import { SddAbortError } from '../runtime/errors.js';
+import { currentBranchName } from '../runtime/git-branch-manager.js';
+import { canonicalRepoRoot, getLockFilePath, getRepoDir } from '../runtime/paths.js';
+import { getRunContext, isLocalMode } from '../runtime/run-context.js';
 import { generateBranchName, normalizeTaskName } from '../runtime/task-name.js';
 import { cleanupTaskWorkspace } from '../runtime/task-workspace.js';
-import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.js';
 
 /**
  * The bootstrap node: the deterministic setup of a run.
@@ -36,10 +40,27 @@ import type { GraphState, InterruptPayload, NodeOutcome } from '../graph/state.j
  * `interrupt()` runs twice - once before the run parks and once after the
  * answer arrives - so the checks that decide whether the user has to be
  * asked are read-only.
+ *
+ * **就地模式（local）**：程式碼直接寫在使用者的業務倉庫裡，沒有 clone 出來
+ * 的副本，所以「倉庫路徑」是使用者的倉庫根（`getRunContext().repoRoot`），
+ * 不是 `getRepoDir()`——後者在就地模式指的是 `.sdd/tasks/<task>/repo`，
+ * 那只是一個空殼，不是倉庫。
  */
 
 /** How many times the node tries the clone before it asks the user. */
 const MAX_ATTEMPTS = 3;
+
+/** The stage this node owns - the ledger key of its steps. */
+const STAGE = 'bootstrap';
+
+/**
+ * The ledger step that remembers the answer to the dirty-worktree gate.
+ *
+ * **答案必須記在台賬裡**：LangGraph resume 時整個節點從頭重跑，而
+ * `proceed` **不改變世界**——工作區還是髒的。沒有這本帳，第二個執行又會
+ * 看到髒、又會再開一次閘門，使用者永遠答不完。
+ */
+const STEP_DIRTY_WORKTREE = 'dirty-worktree';
 
 /** Options of {@link bootstrapNode}. */
 export interface BootstrapOptions {
@@ -60,6 +81,12 @@ export async function bootstrapNode(
   const lockPath = opts.lockPath ?? getLockFilePath();
   const normalizedTaskName = normalizeTaskName(state.requirementName);
   const branch = generateBranchName(normalizedTaskName);
+  const local = isLocalMode();
+
+  // **使用者答過髒工作區了嗎？**（本節點的台賬）
+  // 這是本節點唯一會「問第二次」的危險所在：`proceed` 不改變世界，
+  // 沒有這本帳，resume 之後的執行會再問一次。
+  const dirtyApproved = hasStageStep(state, STAGE, STEP_DIRTY_WORKTREE);
 
   // Has this execution already asked the user something?
   let asked = false;
@@ -79,10 +106,15 @@ export async function bootstrapNode(
       }
     } else if (action === 'reset') {
       // 'reset': throw the old workspace away and start over.
-      cleanupTaskWorkspace(normalizedTaskName);
+      cleanupWorkspace(normalizedTaskName);
     } else if (repoIsCloned(normalizedTaskName)) {
       // 'resume': keep the workspace the previous run prepared.
       return adoptWorkspace(normalizedTaskName, branch, lockPath);
+    } else if (local) {
+      // 就地模式沒有「clone 了一半的倉庫」：那個空殼本來就不存在。
+      // 刪它只是為了清掉舊版本可能留下的殼——刪不掉也不該讓這輪 run 死在這裡，
+      // 裡面沒有使用者的任何東西。
+      removeRepoShell(normalizedTaskName);
     } else {
       // 'resume', but the previous run never finished its clone: the repo
       // directory is an empty shell. Only that shell is thrown away - the
@@ -94,9 +126,44 @@ export async function bootstrapNode(
 
   // ---- Step 2: the deterministic work -----------------------------------
   for (let attempt = 1; ; attempt += 1) {
-    const result = await startTask(state.requirementName, state.repoUrl, { lockPath });
+    const result = await startTask(state.requirementName, state.repoUrl, {
+      lockPath,
+      // **使用者已經批准留在當前分支上工作**：不切分支，工作區是髒的也照跑。
+      // 這是 `proceed` 的全部意思——使用者的改動原封不動地留在原地。
+      ...(local && dirtyApproved ? { skipBranchSwitch: true } : {}),
+    });
     if (result.success) {
       return advance(result);
+    }
+
+    if (result.errorCode === 'dirty_worktree' && !dirtyApproved) {
+      // **髒工作區閘門**：使用者自己正在寫的東西，插件不替他 stash、
+      // 不替他帶走——這必須由使用者決定。
+      if (asked) {
+        // 這一次執行已經問過使用者了（一次執行只能問一次）
+        // → 同一個問題留到下一個執行再問。
+        return askAgain();
+      }
+      const action = actionOf(interrupt(dirtyWorktreePayload(normalizedTaskName)));
+      if (action === 'proceed') {
+        // **把決定記進台賬**，然後回到自己：下一個執行帶著台賬重跑，
+        // 就會走「使用者已經批准過」那條路，不會再問第二次。
+        return {
+          kind: 'advance',
+          update: recordStageStep(STAGE, STEP_DIRTY_WORKTREE, 'proceed'),
+          goto: 'bootstrap',
+        };
+      }
+      if (action === 'abort') {
+        // 使用者喊停：鎖要還回去（否則這個倉庫會一直被鎖住），
+        // checkpoint 留著，使用者還能 resume 這一輪。
+        releaseLock(lockPath);
+        throw new SddAbortError(
+          '使用者中止了這輪運行：工作區有未提交的改動，未建立工作分支。'
+        );
+      }
+      // 認不出的答案 → 再問一次（不能當成放行）。
+      return askAgain();
     }
 
     if (result.errorCode === 'lock_conflict') {
@@ -167,14 +234,23 @@ function adoptWorkspace(
   branch: string,
   lockPath: string
 ): NodeOutcome {
-  const repoPath = getRepoDir(normalizedTaskName);
+  const repoPath = repoPathOf(normalizedTaskName);
   const runId = readRunId(normalizedTaskName);
+  // **就地模式的分支不是插件自己開的那條**：使用者可能選了「留在當前分支
+  // 幹活」，所以要記「真的所在」的分支，後面的流程才知道自己在哪裡。
+  const effectiveBranch = isLocalMode() ? currentBranchName(repoPath) : branch;
 
   const lock = getLock(lockPath);
   if (!lock?.running) {
     // The lock is free: take it. (A lock held by somebody else was already
     // asked about in the gate above - the lock is either free or ours.)
-    const acquired = acquireLock(normalizedTaskName, branch, repoPath, runId, lockPath);
+    const acquired = acquireLock(
+      normalizedTaskName,
+      effectiveBranch,
+      repoPath,
+      runId,
+      lockPath
+    );
     if (!acquired.success) {
       // The lock could not be taken: the run must not advance without it.
       // The next execution asks the user about the lock.
@@ -189,7 +265,7 @@ function adoptWorkspace(
       currentStage: 'prd',
       requirementName: normalizedTaskName,
       repoPath,
-      branch,
+      branch: effectiveBranch,
       runId,
     },
     goto: 'prd',
@@ -223,7 +299,15 @@ function askAgain(): NodeOutcome {
   return { kind: 'advance', update: {}, goto: 'bootstrap' };
 }
 
-/** The payload of the gate that asks the user about a blocker. */
+/**
+ * The payload of the gate that asks the user about a blocker.
+ *
+ * **只認得兩種 blocker**（鎖衝突、既有工作區）。髒工作區**不是** blocker——
+ * 它是 `startTask()` 回報的一種失敗，所以它有自己的 payload
+ * （{@link dirtyWorktreePayload}）：走這條路的閘門若被誤套成
+ * `already_exists`，使用者會看到「要 resume 還是 reset」，那跟髒工作區
+ * 一點關係都沒有。
+ */
 function payloadFor(blocker: StartTaskBlocker): InterruptPayload {
   if (blocker.kind === 'lock_conflict') {
     return {
@@ -236,6 +320,32 @@ function payloadFor(blocker: StartTaskBlocker): InterruptPayload {
     };
   }
   return { audience: 'user', type: 'already_exists', options: ['resume', 'reset'] };
+}
+
+/**
+ * The payload of the gate that asks about a dirty worktree.
+ *
+ * **問人，不是工作單**：`audience: 'user'` 讓 CLI 走 `approve` 那條路，
+ * 而不是把這個閘口當成要 host 去完成的工作。
+ *
+ * **兩個選項的意思相反到不行**：`proceed` 是「就留在現在這個分支上幹活」，
+ * `abort` 是「不幹了」。閘門的訊息要說清楚 `proceed` 會發生什麼事——
+ * 使用者是在決定自己的未提交改動會不會被帶到別的分支上。
+ */
+function dirtyWorktreePayload(normalizedTaskName: string): InterruptPayload {
+  const repoPath = repoPathOf(normalizedTaskName);
+  const branch = currentBranchName(repoPath);
+  return {
+    audience: 'user',
+    type: 'dirty_worktree',
+    code: 'dirty_worktree',
+    options: ['proceed', 'abort'],
+    message:
+      `${repoPath} 的工作區有已跟蹤文件的改動，插件不會自動 stash，` +
+      '也不會把這些改動帶到新分支。' +
+      `選 proceed：留在當前分支（${branch}）上工作，使用者的改動原封不動；` +
+      '選 abort：中止這輪運行。',
+  };
 }
 
 /**
@@ -271,9 +381,69 @@ export function actionOf(answer: unknown): string | undefined {
   return undefined;
 }
 
-/** Did a previous run really clone the repository? */
+/**
+ * 這輪運行的倉庫路徑。
+ *
+ * **就地模式是使用者的業務倉庫**：`getRepoDir()` 在就地模式指的是
+ * `.sdd/tasks/<task>/repo`——那不是一個倉庫，只是插件自己的空殼，
+ * 拿它當倉庫路徑會讓整輪 run 在一個不是倉庫的地方工作。
+ *
+ * @param normalizedTaskName - 正規化的 task 名
+ */
+function repoPathOf(normalizedTaskName: string): string {
+  return isLocalMode() ? localRepoRoot() : getRepoDir(normalizedTaskName);
+}
+
+/**
+ * 就地模式的倉庫根（使用者的業務倉庫）。
+ *
+ * **正規化過的**：macOS 的 `/var` 是 `/private/var` 的符號連結，
+ * 未正規化的路徑會讓顯示、比對、鎖的記錄對不上。
+ */
+function localRepoRoot(): string {
+  return canonicalRepoRoot(getRunContext().repoRoot);
+}
+
+/**
+ * Did a previous run really clone the repository?
+ *
+ * **就地模式沒有 clone**：工作區就是使用者的業務倉庫，
+ * 「準備好了」的判準是那個倉庫確實是 git 倉庫。
+ */
 function repoIsCloned(normalizedTaskName: string): boolean {
-  return fs.existsSync(path.join(getRepoDir(normalizedTaskName), '.git'));
+  // 就地模式沒有 clone：工作區就是使用者的業務倉庫，
+  // 「準備好了」的判準是那個倉庫確實是 git 倉庫。
+  return fs.existsSync(path.join(repoPathOf(normalizedTaskName), '.git'));
+}
+
+/**
+ * 清掉舊工作區；刪不掉時不得讓整輪 run 死在這裡。
+ *
+ * `cleanupTaskWorkspace()` 在刪除目標越界時會拋錯——那是資料安全的硬保護，
+ * 不能拿掉。但那個錯誤跟使用者的答案無關，它只是「這個目錄刪不掉」，
+ * 讓它從節點裡逃出去只會讓這輪 run 以為使用者放棄了。
+ */
+function cleanupWorkspace(normalizedTaskName: string): void {
+  try {
+    cleanupTaskWorkspace(normalizedTaskName);
+  } catch (err) {
+    console.warn('Failed to clean up the task workspace:', err);
+  }
+}
+
+/**
+ * 清掉「clone 了一半的倉庫」那個空殼。
+ *
+ * **就地模式那個目錄本來就不存在**（插件在就地模式不建 `repo/`），
+ * 刪它只是為了清掉舊版本可能留下的殼；刪不掉也不該讓這輪 run 死在這裡——
+ * 那個目錄裡沒有使用者的任何東西。
+ */
+function removeRepoShell(normalizedTaskName: string): void {
+  try {
+    fs.rmSync(getRepoDir(normalizedTaskName), { recursive: true, force: true });
+  } catch (err) {
+    console.warn('Failed to remove the empty repo shell:', err);
+  }
 }
 
 /** Are these the errors a retry can fix? */

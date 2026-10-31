@@ -19,6 +19,25 @@ export type ErrorCode =
 export type ErrorCategory = 'auto_fixable' | 'needs_human' | 'infra_error';
 
 /**
+ * 使用者喊停了這輪運行。
+ *
+ * **這不是失敗，是使用者自己的決定**：所以它有自己的 `code`（`'aborted'`），
+ * CLI 靠它認出「使用者中止」而不是「插件壞了」——退出碼與訊息都不同
+ * （CLI 那邊的映射由後續任務接上）。
+ *
+ * **checkpoint 留著**：使用者還可以 `resume` 這一輪，
+ * 中止的是這一輪，不是整個 task。
+ */
+export class SddAbortError extends Error {
+  readonly code = 'aborted';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'SddAbortError';
+  }
+}
+
+/**
  * Structured error with recovery hints.
  */
 export interface TaskInitError {
