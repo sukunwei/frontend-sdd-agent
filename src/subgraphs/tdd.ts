@@ -32,8 +32,23 @@ import {
   recordUserAnswer,
 } from '../nodes/tdd.js';
 import { isGitRepository, resetToTaskStart, tagTaskStart } from '../runtime/git-tags.js';
+import { isLocalMode } from '../runtime/run-context.js';
 import { ReviewResultSchema } from '../state/schema.js';
 import type { Blocker, ReviewResult, Task } from '../state/types.js';
+
+/**
+ * 就地模式（local）下的回滾說明。
+ *
+ * **就地模式不做任何自動回滾。** 就地模式的 `repoDir` 就是使用者的業務倉庫，
+ * 插件沒有權限代替使用者決定哪些改動該被撤銷——壞掉的程式碼原封不動留在倉庫
+ * 裡，由使用者自己收拾。（遠端模式的 `repoDir` 是插件 clone 出來的一次性副本，
+ * 回滾砸的是副本，所以那條路徑照舊。）
+ *
+ * **這句話必須跟著閘門一起到使用者面前。** 只給一個 `rollback: 'skipped'`
+ * 不夠——使用者會以為插件已經清理過了，等於被騙。
+ */
+const LOCAL_NO_ROLLBACK_MESSAGE =
+  '就地模式不做任何自動回滾，壞代碼留在你的業務倉庫裡，請手動處理。';
 
 /**
  * The TDD loop: one task at a time, in the order of `state.tasks`.
@@ -64,6 +79,12 @@ import type { Blocker, ReviewResult, Task } from '../state/types.js';
  * **A task that keeps failing is escalated** (see `escalate`): the developer
  * gets the review and another turn, then the code is rolled back to the start
  * of the task, and finally the user is asked what should happen to the run.
+ *
+ * **就地模式（local）不做任何自動回滾，也不打 tag。** 就地模式的 `repoDir`
+ * 就是使用者的業務倉庫：`git reset --hard` 會連他沒提交的改動一起抹掉，而
+ * 「哪些改動該被撤銷」是使用者的判斷，不是插件的。所以就地模式下壞掉的程式碼
+ * 原封不動留在使用者的倉庫裡，由使用者自己收拾（閘門會把這件事說清楚）。遠端
+ * （克隆）模式的行為逐字不變。
  */
 export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
   const tasks = state.tasks ?? [];
@@ -81,6 +102,13 @@ export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
     // What the rollback did rides along with the gate: the user has to know
     // whether the broken code is still on disk before answering.
     const rollback = gate.rollback !== undefined ? { rollback: gate.rollback } : {};
+    // **就地模式的閘門要多說一句。** 那個 `skipped` 不只是一個狀態碼：壞代碼
+    // 還在使用者的業務倉庫裡，插件不會替他收拾，所以這句話得由閘門帶到使用者
+    // 面前（`question` 是會被 host 念出來給使用者聽的那一段）。
+    const localQuestion =
+      isLocalMode() && gate.rollback === 'skipped'
+        ? { question: LOCAL_NO_ROLLBACK_MESSAGE }
+        : {};
     const given = readGateAnswer(state);
     if (given === undefined) {
       const answer = interrupt({
@@ -89,6 +117,7 @@ export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
         options: gate.options,
         taskId: gate.taskId,
         ...rollback,
+        ...localQuestion,
       });
       return { kind: 'advance', update: recordGateAnswer(answer), goto: STAGE_NODE_NAMES.tdd };
     }
@@ -104,6 +133,7 @@ export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
         options: gate.options,
         taskId: gate.taskId,
         ...rollback,
+        ...localQuestion,
         previousAnswer: readUnparsedGateAnswers(state) ?? given.raw,
         note:
           'the previous answer could not be read; answer with one of the options ' +
@@ -153,12 +183,15 @@ export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
  *
  * The tag comes first: it is the point a rollback goes back to, and it has
  * to exist before the developer writes anything.
+ *
+ * **就地模式不打 tag。** 就地模式的 `repoDir` 就是使用者的業務倉庫：沒有回滾
+ * 就沒有回滾點，不需要這個 ref，而且使用者的倉庫不該多出插件的 ref。
  */
 async function developerStep(state: GraphState, task: Task): Promise<NodeOutcome> {
   const repoDir = state.repoPath;
   // A workspace that was never cloned is not a repository: there is no tag
   // to create and nothing to roll back to.
-  if (isGitRepository(repoDir)) {
+  if (isGitRepository(repoDir) && !isLocalMode()) {
     tagTaskStart(repoDir, task.id);
   }
 
@@ -551,17 +584,23 @@ function readReview(answer: unknown, role: 'spec' | 'quality'): ReviewResult | u
  *
  * - `done` — the code went back to the start of the task.
  * - `skipped` — there was nothing to roll back to (the workspace was never
- *   cloned, so there is no repository and no tag).
+ *   cloned, so there is no repository and no tag) **or the run works in place
+ *   (local mode), where no rollback happens at all**.
  * - `failed` — the repository is there, but the reset did not work (the tag
  *   does not exist).
  *
  * In the last two cases **the broken code is still on disk**, and the user
  * has to know it before answering the gate.
  *
+ * **就地模式完全不回滾。** `repoDir` 是使用者的業務倉庫，`git reset --hard`
+ * 會連他沒提交的改動一起抹掉；而且「哪些改動該被撤銷」是使用者的判斷，不是
+ * 插件的。所以就地模式下一個 git 指令都不跑，壞代碼原樣留著由使用者收拾。
+ *
  * @param repoDir - The repository of the run.
  * @param taskId - The task that is rolled back.
  */
 function rollbackOutcome(repoDir: string, taskId: string): 'done' | 'skipped' | 'failed' {
+  if (isLocalMode()) return 'skipped';
   if (!isGitRepository(repoDir)) return 'skipped';
   return resetToTaskStart(repoDir, taskId) ? 'done' : 'failed';
 }
