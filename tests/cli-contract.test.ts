@@ -568,11 +568,38 @@ describe('CLI 合約', () => {
     expect(lock.taskName).toBe('other-task');
   });
 
-  it('stop --force 才會釋放別的 task 持有的全域鎖', async () => {
+  it('stop --force 也不釋放別的 task 持有的全域鎖（行為變更：force 不再越界）', async () => {
+    // **行為變更**：`--force` 以前會把別的 task 握著的鎖刪掉，那等於替別人
+    // 中止了他正在跑的那一輪；刪掉的是所有倉庫共用的全域鎖，別的倉庫正在
+    // 跑的 run 會因此失去保護。現在 `--force` 只處理沒有活著持有者的鎖。
     fs.writeFileSync(
       lockFile,
       JSON.stringify({
         running: true,
+        taskName: 'other-task',
+        branch: 'task/other-task',
+        repoPath: '/repo',
+        runId: 'run_1',
+        startedAt: new Date().toISOString(),
+      }),
+      'utf-8'
+    );
+
+    const rc = await runCli(['stop', '--task', 'my-task', '--force'], { lockPath: lockFile });
+    const captured = io.take();
+    expect(rc).toBe(1);
+    expect(JSON.parse(captured.err).code).toBe('lock_not_owned');
+    // 鎖還在別的 task 手上
+    expect(fs.existsSync(lockFile)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockFile, 'utf-8')).taskName).toBe('other-task');
+  });
+
+  it('stop --force 會刪掉沒有活著持有者的鎖（自己的、壞掉的、已停的）', async () => {
+    // 已停的鎖：檔案還在，但沒有人在跑
+    fs.writeFileSync(
+      lockFile,
+      JSON.stringify({
+        running: false,
         taskName: 'other-task',
         branch: 'task/other-task',
         repoPath: '/repo',

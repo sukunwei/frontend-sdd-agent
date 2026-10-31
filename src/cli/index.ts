@@ -243,6 +243,14 @@ async function cmdStart(args: ParsedArgs, opts: RunCliOptions): Promise<number> 
   const config = configOf(threadId);
 
   const resolved = resolveRepo(repoSpec, process.cwd());
+  // **就地模式只認目前目錄所在的倉庫**：整個設計的前提是「命令在哪個業務
+  // 倉庫目錄裡執行，就操作那個倉庫的同名 task」。允許 `--repo` 指向另一個
+  // 倉庫會造出兩種壞掉的 run：之後在任何地方都找不到它，而且「在 repo A
+  // 啟動、在 repo B 裡 resume」會把 run 綁到 B 的同名 task 上——模式與
+  // `start` 設的不一樣。
+  if (resolved.mode === 'local') {
+    assertSameRepoAsCwd(resolved.repoRoot);
+  }
   setRunContext(contextOf(resolved));
 
   // 就地模式不該把本機絕對路徑寫進要進版本庫的 `workflow-state.json` 鏡像：
@@ -593,11 +601,18 @@ async function cmdStop(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
 
   // The lock is global: releasing a lock another task holds would let a
   // third task work on the same branch.
+  //
+  // **`--force` 也不越界（行為變更）**：以前 `--force` 會把別的 task 握著的
+  // 鎖直接刪掉，那等於替別人中止了他正在跑的那一輪——而且刪掉的是**所有倉庫
+  // 共用的全域鎖**，別的倉庫正在跑的 run 會因此失去保護。
+  // 現在 `--force` 只處理「沒有活著的持有者」的鎖（自己的、壞掉的、已停的）；
+  // 別的 task 還握著就報錯，讓使用者先 `stop --task <那個 task>`。
   const ownership = validateLockOwnership(threadId, lockPath);
-  if (ownership.isLocked && !ownership.isHolder && !force) {
+  if (ownership.isLocked && !ownership.isHolder) {
     throw new CliError(
       'lock_not_owned',
-      `the branch lock is held by ${ownership.holderTaskName ?? 'another task'}`
+      `the branch lock is held by ${ownership.holderTaskName ?? 'another task'}` +
+        '；請先 stop 那個 task，或等它跑完'
     );
   }
 
@@ -779,6 +794,13 @@ interface CheckpointCandidate {
   checkpointPath: string;
   /** 分支鎖檔。 */
   lockPath: string;
+  /**
+   * 這個位置為什麼查不了（有的話）。
+   *
+   * **被跳過的位置也要寫進錯誤訊息**：使用者最需要知道的就是
+   * 「你的 task 可能在某個業務倉庫的 `.sdd` 裡，請 cd 到那裡再試」。
+   */
+  unavailable?: string;
 }
 
 /**
@@ -791,7 +813,8 @@ interface CheckpointCandidate {
  * - 後查舊位置：遠端模式的用法（`--repo <url>` + 之後的 `resume`）不能被
  *   這次改動打斷——查不到就地位置時必須往回落。
  *
- * cwd 不在 git 倉庫裡時就地位置直接略過（那裡沒有業務倉庫可工作）。
+ * **cwd 不在 git 倉庫裡時就地位置查不了，但還是列在清單裡**：
+ * 錯誤訊息要告訴使用者「就地的那一份存在哪裡、為什麼沒查」。
  *
  * @param cwd - 使用者目前所在的目錄
  */
@@ -810,6 +833,17 @@ function resolveCheckpointCandidates(cwd: string): CheckpointCandidate[] {
       checkpointPath: path.join(sddHome, 'checkpoints.sqlite'),
       lockPath: path.join(sddHome, 'branch-lock.json'),
     });
+  } else {
+    // **查不了就地位置，但使用者最需要知道它**：這裡的檔案路徑只是給
+    // 錯誤訊息看的（猜測：倉庫就在 cwd 底下），不是真的會去開它。
+    candidates.push({
+      mode: 'local',
+      repoRoot: '',
+      sddHome: '',
+      checkpointPath: path.join(cwd, '.sdd', 'checkpoints.sqlite'),
+      lockPath: '',
+      unavailable: '目前目錄不在 git 倉庫裡，沒有就地工作的位置可查',
+    });
   }
 
   const pluginRoot = getPluginRoot();
@@ -822,6 +856,21 @@ function resolveCheckpointCandidates(cwd: string): CheckpointCandidate[] {
   });
 
   return candidates;
+}
+
+/**
+ * 這個候選位置在錯誤訊息裡怎麼說。
+ *
+ * **被跳過的位置也要列出來**：使用者要知道插件去哪裡找過、為什麼沒查。
+ */
+function describeCandidate(candidate: CheckpointCandidate): string {
+  if (candidate.unavailable) {
+    return `${candidate.checkpointPath}（${candidate.unavailable}）`;
+  }
+  if (!fs.existsSync(candidate.checkpointPath)) {
+    return `${candidate.checkpointPath}（檔案不存在）`;
+  }
+  return candidate.checkpointPath;
 }
 
 /**
@@ -849,6 +898,10 @@ async function withGraphForThread<T>(
   const config = configOf(threadId);
 
   for (const candidate of candidates) {
+    // 這個位置根本查不了（cwd 不在 git 倉庫裡）。
+    if (candidate.unavailable) {
+      continue;
+    }
     // 沒有檔案就沒有 thread：**不開資料庫**，免得在使用者的倉庫裡憑空造出
     // 一個 `.sdd/checkpoints.sqlite`。
     if (!fs.existsSync(candidate.checkpointPath)) {
@@ -869,7 +922,7 @@ async function withGraphForThread<T>(
   throw new CliError(
     'no_checkpoint',
     `no checkpoint for thread ${threadId} (searched: ${candidates
-      .map((candidate) => candidate.checkpointPath)
+      .map((candidate) => describeCandidate(candidate))
       .join(', ')})`
   );
 }
@@ -932,30 +985,67 @@ function remoteContext(): RunContext {
 }
 
 /**
+ * 就地模式的目標倉庫必須就是目前目錄所在的倉庫。
+ *
+ * **兩個路徑正規化後要一樣**：正規化（`canonicalRepoRoot`）讓 macOS 的
+ * `/var` 與 `/private/var` 不會被當成兩個倉庫；比較的是**倉庫根**，
+ * 所以倉庫裡的子目錄（`--repo .`、cwd 在 `src/` 底下）都算同一個倉庫。
+ *
+ * @param repoRoot - `--repo` 解析出來的倉庫根
+ * @throws CliError `validation_error` —— 目標不是目前目錄所在的倉庫。
+ */
+function assertSameRepoAsCwd(repoRoot: string): void {
+  const cwdTop = gitTopLevel(process.cwd());
+  if (cwdTop !== undefined && canonicalRepoRoot(cwdTop) === canonicalRepoRoot(repoRoot)) {
+    return;
+  }
+  throw new CliError(
+    'validation_error',
+    '就地模式要求在業務倉庫目錄裡執行；請 cd 到那個倉庫後省略 --repo' +
+      `（--repo 指向 ${repoRoot}，與目前目錄的倉庫不同）`
+  );
+}
+
+/**
  * 這輪運行的分支鎖在哪裡。
  *
  * **鎖在哪裡，決定了這輪 run 是哪一種**：就地模式的鎖在自己的 `.sdd/` 之下，
  * 遠端模式的鎖在外掛根的 `runtime/` 之下。`stop` 不接收 `--repo`，所以只能
- * 靠鎖的歸屬判斷——**哪一把鎖握著這個 task，就用哪一把**。
+ * 靠候選的歸屬判斷。
  *
- * 沒有任何一把鎖握著這個 task 時，沿用舊行為（外掛根的鎖）。
+ * **三段規則，順序有意義**：
+ * 1. 握著這個 task 的鎖 → 就是它；
+ * 2. 否則取**第一個鎖檔存在**的候選 → 錯誤訊息講的是「你現在這個倉庫」
+ *    的那把鎖，而不是別的倉庫的；
+ * 3. 一個都不存在 → 取第一個可用的候選（回報「沒有鎖」用）。
+ *
+ * **絕不無條件回落到全域鎖**：全域鎖是所有倉庫共用的，動它就是動到別的
+ * 倉庫正在跑的那一輪——使用者只是在自己的專案目錄裡下了 `stop`。
  */
 function resolveLockPath(threadId: string): string {
   const candidates = resolveCheckpointCandidates(process.cwd());
-  for (const candidate of candidates) {
+  const usable = candidates.filter((candidate) => !candidate.unavailable);
+
+  for (const candidate of usable) {
     const lock = getLock(candidate.lockPath);
     if (lock?.running && lock.taskName === threadId) {
       return candidate.lockPath;
     }
   }
-  return candidates[candidates.length - 1].lockPath;
+  for (const candidate of usable) {
+    if (fs.existsSync(candidate.lockPath)) {
+      return candidate.lockPath;
+    }
+  }
+  return (usable[0] ?? candidates[candidates.length - 1]).lockPath;
 }
 
 /**
  * 就地模式寫進 state 的倉庫標記。
  *
  * **不能是本機絕對路徑**：那份鏡像要進版本庫，寫進去的是每台機器都不一樣的
- * 路徑。寫遠端地址；沒有遠端就寫 `local:<目錄名>`——至少看得出是哪個專案。
+ * 路徑。寫遠端地址；沒有遠端（或遠端本身就是一個本機路徑）就寫
+ * `local:<目錄名>`——至少看得出是哪個專案。
  *
  * @param repoRoot - 業務倉庫根
  */
@@ -966,13 +1056,37 @@ function localRepoUrl(repoRoot: string): string {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, LC_ALL: 'C' },
     }).trim();
-    if (url !== '') {
+    if (url !== '' && !looksLikeLocalPath(url)) {
       return url;
     }
   } catch {
     // 沒有遠端（或 git 失敗）：改用目錄名。
   }
   return `local:${path.basename(repoRoot)}`;
+}
+
+/**
+ * 這個 remote url 是不是一個本機檔案系統路徑？
+ *
+ * **`remote.origin.url` 也可能指著本機的一個目錄**（`/Users/x/repos/foo`、
+ * `file:///Users/x/repos/foo`、相對路徑……）。那樣的絕對路徑一樣不該進
+ * 版本庫——這正是這個函式要避免的事。
+ *
+ * 認得的三種形狀：`file://`、Windows 磁碟路徑（`C:\...`）、以及沒有 scheme
+ * 也沒有 scp 語法（`git@host:path` 之外）的路徑。
+ */
+function looksLikeLocalPath(url: string): boolean {
+  if (url.startsWith('file://')) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(url)) {
+    return true;
+  }
+  if (url.startsWith('/') || url.startsWith('./') || url.startsWith('../')) {
+    return true;
+  }
+  // 沒有 `:` = 沒有 scheme、也不是 `git@host:path` → 是檔案系統路徑。
+  return !url.includes(':');
 }
 
 /**
@@ -1001,6 +1115,10 @@ function gitignoreNotice(repoRoot: string): string | undefined {
  *
  * `git check-ignore` 對「沒被忽略」回傳退出碼 1（不是錯誤），所以退出碼
  * 1 與其他失敗都當成「沒被忽略」：多一句提示無害，少一句才會漏掉真正的問題。
+ *
+ * **「git 失敗」也落在同一邊**：git 不在 PATH、目錄不是倉庫、逾時——
+ * 全都回 false（當成沒被忽略），因為使用者寧可多看到一句提醒，
+ * 也不要以為 `.sdd/` 已經被忽略而把它 commit 進去。
  *
  * @param repoRoot - 倉庫根
  * @param relativePath - 相對於倉庫根的路徑

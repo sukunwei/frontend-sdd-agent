@@ -49,6 +49,29 @@ function currentBranch(dir: string): string {
   }).trim();
 }
 
+/**
+ * 寫一把分支鎖。
+ *
+ * @param file - 鎖檔路徑
+ * @param taskName - 握著這把鎖的 task
+ * @param running - 鎖是不是還在跑
+ */
+function writeLock(file: string, taskName: string, running = true): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      running,
+      taskName,
+      branch: `task/${taskName}`,
+      repoPath: '/repo',
+      runId: 'run_1',
+      startedAt: new Date().toISOString(),
+    }),
+    'utf-8'
+  );
+}
+
 /** 一個 JSON 信封。 */
 interface Envelope {
   [key: string]: unknown;
@@ -253,6 +276,51 @@ describe('CLI 的就地模式（local）', () => {
     expect(approved.out).toBe('');
     expect(JSON.parse(approved.err).code).toBe('aborted');
   });
+
+  it('--repo 指向另一個倉庫時必須拒絕（就地模式只認目前目錄的倉庫）', async () => {
+    const other = createRepo('sdd-cli-other-repo-');
+    try {
+      const rc = await runCli(['start', '--task', 'local-task', '--repo', other]);
+      const captured = io.take();
+
+      expect(rc).toBe(1);
+      expect(captured.out).toBe('');
+      const err = JSON.parse(captured.err) as Envelope;
+      expect(err.code).toBe('validation_error');
+      expect(String(err.message)).toContain('cd');
+      // 另一個倉庫不得被動到
+      expect(fs.existsSync(path.join(other, '.sdd'))).toBe(false);
+    } finally {
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  it('--repo . 與省略 --repo 等價（同一個倉庫）', async () => {
+    const rc = await runCli(['start', '--task', 'local-task', '--repo', '.']);
+    const captured = io.take();
+
+    expect(rc).toBe(2);
+    expect(JSON.parse(captured.out).threadId).toBe('local-task');
+    expect(currentBranch(repo)).toBe('task/local-task');
+    expect(fs.existsSync(path.join(repo, '.sdd', 'checkpoints.sqlite'))).toBe(true);
+  });
+
+  it('origin url 是本機路徑時，鏡像裡不得出現那個絕對路徑', async () => {
+    // 遠端指著本機的一個目錄——那樣的絕對路徑一樣不該進版本庫。
+    execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', '/Users/someone/elsewhere'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    await runCli(['start', '--task', 'local-task']);
+    io.take();
+
+    const mirror = JSON.parse(
+      fs.readFileSync(path.join(repo, 'docs', 'local-task', 'workflow-state.json'), 'utf-8')
+    ) as { repoUrl: string };
+    expect(mirror.repoUrl).toBe(`local:${path.basename(repo)}`);
+    expect(mirror.repoUrl).not.toContain('/Users/someone/elsewhere');
+  });
 });
 
 /**
@@ -329,6 +397,131 @@ describe('checkpoint 查找鏈（真的行程）', () => {
       expect(message).toContain('runtime/checkpoints.sqlite');
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('cwd 不在倉庫裡時，no_checkpoint 的訊息仍然列出兩個位置', () => {
+    // 就地的那一份查不了（cwd 不是倉庫），但**那正是使用者最需要知道的**：
+    // 「你的 task 可能在某個業務倉庫的 .sdd 裡，請 cd 到那裡再試」。
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-cli-chain-norepo-'));
+    try {
+      const r = bin(['resume', '--task', 'nothing-here'], elsewhere);
+
+      expect(r.rc).toBe(1);
+      expect(r.err?.code).toBe('no_checkpoint');
+      const message = String(r.err?.message);
+      expect(message).toContain('.sdd/checkpoints.sqlite');
+      expect(message).toContain('runtime/checkpoints.sqlite');
+    } finally {
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('remote 模式的 status 與 stop 也走新鏈路（找得到外掛根的那一輪）', () => {
+    const started = bin(['start', '--task', 'legacy-task', '--repo', fixture.url], os.tmpdir());
+    expect(started.rc).toBe(2);
+
+    const status = bin(['status', '--task', 'legacy-task'], os.tmpdir());
+    expect(status.rc).toBe(0);
+    expect(status.out?.kind).toBe('result');
+    expect(status.out?.stage).toBe('prd');
+
+    const stopped = bin(['stop', '--task', 'legacy-task'], os.tmpdir());
+    expect(stopped.rc).toBe(0);
+    // 外掛根的鎖被釋放了（遠端模式的鎖就在那裡）
+    const globalLock = path.join(plugin, 'runtime', 'branch-runtime-lock.json');
+    expect(JSON.parse(fs.readFileSync(globalLock, 'utf-8')).running).toBe(false);
+  }, 120_000);
+
+  it('stop 只動同一個倉庫的鎖：別的 task 握著本倉庫的鎖時，訊息講的是那把鎖', () => {
+    const repo = createRepo('sdd-cli-stop-repo-');
+    try {
+      // 就地模式跑一輪：鎖在業務倉庫的 .sdd 之下
+      expect(bin(['start', '--task', 'local-task'], repo).rc).toBe(2);
+      const localLock = path.join(repo, '.sdd', 'branch-lock.json');
+      expect(fs.existsSync(localLock)).toBe(true);
+
+      // 全域鎖（外掛根的）被另一個 task 握著
+      const globalLock = path.join(plugin, 'runtime', 'branch-runtime-lock.json');
+      writeLock(globalLock, 'global-other');
+      // 本倉庫的鎖被另一個 task 握著
+      writeLock(localLock, 'local-other');
+
+      const stopped = bin(['stop', '--task', 'local-task'], repo);
+
+      expect(stopped.rc).toBe(1);
+      expect(stopped.err?.code).toBe('lock_not_owned');
+      // **訊息講的是本倉庫那把鎖**，不是全域那把。
+      expect(String(stopped.err?.message)).toContain('local-other');
+      expect(String(stopped.err?.message)).not.toContain('global-other');
+      // 兩把鎖都還在
+      expect(JSON.parse(fs.readFileSync(localLock, 'utf-8')).taskName).toBe('local-other');
+      expect(JSON.parse(fs.readFileSync(globalLock, 'utf-8')).taskName).toBe('global-other');
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('stop --force 也不刪掉別的 task 握著的鎖（行為變更）', () => {
+    const repo = createRepo('sdd-cli-force-repo-');
+    try {
+      expect(bin(['start', '--task', 'local-task'], repo).rc).toBe(2);
+      const localLock = path.join(repo, '.sdd', 'branch-lock.json');
+      const globalLock = path.join(plugin, 'runtime', 'branch-runtime-lock.json');
+      writeLock(globalLock, 'global-other');
+      writeLock(localLock, 'local-other');
+
+      const forced = bin(['stop', '--task', 'local-task', '--force'], repo);
+
+      expect(forced.rc).toBe(1);
+      expect(forced.err?.code).toBe('lock_not_owned');
+      // 兩把鎖都還在——`--force` 不得替別人中止他正在跑的那一輪。
+      expect(fs.existsSync(localLock)).toBe(true);
+      expect(fs.existsSync(globalLock)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(globalLock, 'utf-8')).running).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('stop 從倉庫裡的另一個目錄執行，釋放的還是本倉庫的鎖', () => {
+    const repo = createRepo('sdd-cli-subdir-repo-');
+    try {
+      expect(bin(['start', '--task', 'local-task'], repo).rc).toBe(2);
+      const localLock = path.join(repo, '.sdd', 'branch-lock.json');
+      const globalLock = path.join(plugin, 'runtime', 'branch-runtime-lock.json');
+      writeLock(globalLock, 'global-other');
+
+      const sub = path.join(repo, 'src');
+      fs.mkdirSync(sub, { recursive: true });
+      const stopped = bin(['stop', '--task', 'local-task'], sub);
+
+      expect(stopped.rc).toBe(0);
+      // 本倉庫的鎖被釋放
+      expect(JSON.parse(fs.readFileSync(localLock, 'utf-8')).running).toBe(false);
+      // 全域鎖一個字都沒被動到
+      expect(JSON.parse(fs.readFileSync(globalLock, 'utf-8')).taskName).toBe('global-other');
+      expect(JSON.parse(fs.readFileSync(globalLock, 'utf-8')).running).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('stop 在不是倉庫的目錄裡執行時，動的是外掛根的鎖', () => {
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'sdd-cli-stop-norepo-'));
+    try {
+      const globalLock = path.join(plugin, 'runtime', 'branch-runtime-lock.json');
+      // 沒有人在跑的鎖
+      writeLock(globalLock, 'someone-else', false);
+
+      const stopped = bin(['stop', '--task', 'local-task'], elsewhere);
+
+      expect(stopped.rc).toBe(0);
+      expect(stopped.out?.kind).toBe('result');
+      // 外掛根的鎖被釋放（就地位置根本查不了，只能動外掛根那把）
+      expect(JSON.parse(fs.readFileSync(globalLock, 'utf-8')).running).toBe(false);
+    } finally {
+      fs.rmSync(elsewhere, { recursive: true, force: true });
     }
   }, 120_000);
 });
