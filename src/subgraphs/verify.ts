@@ -4,6 +4,7 @@ import { actionOf } from '../nodes/bootstrap.js';
 import { checkLogPath, runCheck, VERIFY_CHECKS } from '../nodes/verify-checks.js';
 import type { CheckResult, CheckRunner } from '../nodes/verify-checks.js';
 import { getDocsDir } from '../runtime/paths.js';
+import { isLocalMode } from '../runtime/run-context.js';
 import type { Blocker, VerificationCheck } from '../state/types.js';
 
 /**
@@ -15,7 +16,8 @@ import type { Blocker, VerificationCheck } from '../state/types.js';
  *   error makes the result of the other gates meaningless.
  * - `lint` runs next, on its own, because it rewrites the source code
  *   (`--fix`) - a gate that reads the source code at the same time would
- *   read a half-written file.
+ *   read a half-written file. **就地模式沒有 `--fix`**：那會改寫使用者的
+ *   原始碼（見 `checkSpecFor`）。
  * - `test` and `e2e` run **at the same time**: they do not touch the
  *   source code, and the e2e run is usually the slowest one, so the pass
  *   takes the slower of the two instead of the sum of the two.
@@ -249,8 +251,20 @@ function payloadFor(failed: VerificationCheck[], docsDir: string): InterruptPayl
     logs: Object.fromEntries(
       failed.map((check) => [check.name, checkLogPath(docsDir, check.name)])
     ),
+    ...(isLocalMode() ? { message: LOCAL_MODE_MESSAGE } : {}),
   };
 }
+
+/**
+ * 就地模式的閘門訊息。
+ *
+ * **要說清楚「沒有人改你的程式碼」**：就地模式的 lint 閘**不帶 `--fix`**
+ * （`--fix` 會改寫使用者的原始碼），所以閘門失敗時原始碼原封不動——
+ * 使用者得自己修，或讓圖回到 TDD 階段讓工人去修。
+ */
+const LOCAL_MODE_MESSAGE =
+  '就地模式不會用 eslint --fix 改寫你的原始碼：lint 失敗時原始碼原封不動。' +
+  '選 manual 讓圖回到 TDD 階段（工人去修），或自己改完再重跑。';
 
 /**
  * The action of the answer.

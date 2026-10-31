@@ -8,6 +8,14 @@ argument-hint: --task <taskName>
 工作者要重讀工作單 `inputs` 列出的絕對路徑 —— 換會話之後不能靠上一段對話的記憶，
 上一個會話做了什麼不是這張單的依據。
 
+**必須 cd 到那一輪所在的目錄裡執行。** `resume` 沒有 `--repo`：圖靠 cwd 找狀態 ——
+先查 `<cwd 所在倉庫>/.sdd/checkpoints.sqlite`（**就地模式**，預設），查不到才回落到
+`<外掛根>/runtime/checkpoints.sqlite`（**克隆模式**）。兩個位置都沒有這一輪時會回
+`no_checkpoint`，錯誤訊息會把查過的位置列出來。
+
+**換目錄 = 換 run**：在別的倉庫裡 resume 同一個 task 名，拿到的是**那個**倉庫的
+工作單，不是這一輪的。
+
 LOOP:
   1. 執行 sdd-graph resume --task <taskName>（<taskName> 取自本指令的引數）
   2. 依退出碼分支：

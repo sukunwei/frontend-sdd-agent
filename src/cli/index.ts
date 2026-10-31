@@ -1,8 +1,10 @@
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { Command } from '@langchain/langgraph';
 import { z } from 'zod';
+import { listLegacyThreads, migrateState } from '../commands/migrate-state.js';
 import { buildGraph } from '../graph/compile.js';
 import type { CompiledSddGraph } from '../graph/compile.js';
 import { measureFidelity } from '../figma/fidelity.js';
@@ -11,8 +13,26 @@ import { actionOf } from '../nodes/bootstrap.js';
 import { reviewRoles } from '../nodes/review.js';
 import { ArtifactStore } from '../persistence/artifact-store.js';
 import { createCheckpointer } from '../persistence/checkpoint.js';
-import { forceUnlock, releaseLock, validateLockOwnership } from '../runtime/branch-lock.js';
-import { getCheckpointPath, getDocsDir, getLockFilePath } from '../runtime/paths.js';
+import {
+  forceUnlock,
+  getLock,
+  releaseLock,
+  validateLockOwnership,
+} from '../runtime/branch-lock.js';
+import { createError, SddAbortError } from '../runtime/errors.js';
+import {
+  assertSddHomeSeparate,
+  canonicalRepoRoot,
+  getCheckpointPath,
+  getDocsDir,
+  getLockFilePath,
+  getPluginRoot,
+  getWorkspaceBase,
+} from '../runtime/paths.js';
+import { defaultSddHome, isLocalMode, setRunContext } from '../runtime/run-context.js';
+import type { RepoMode, RunContext } from '../runtime/run-context.js';
+import { gitTopLevel, RepoResolutionError, resolveRepo } from '../runtime/repo-resolver.js';
+import type { ResolvedRepo } from '../runtime/repo-resolver.js';
 import { normalizeTaskName } from '../runtime/task-name.js';
 import { cleanupTaskWorkspace } from '../runtime/task-workspace.js';
 import { ReviewResultSchema } from '../state/schema.js';
@@ -31,15 +51,20 @@ import type { RejectionReason, WorkOrder } from './protocol.js';
  * The CLI contract between the graph and the Claude Code session.
  *
  * ```
- * sdd-graph start   --task <n> --repo <url>
+ * sdd-graph start   --task <n> [--repo <path|url>]
  * sdd-graph resume  --task <n>
  * sdd-graph complete --task <n> --result <json|@file>
  * sdd-graph approve  --task <n> --payload <json|@file>
  * sdd-graph status   --task <n>
  * sdd-graph stop     --task <n> [--force]
+ * sdd-graph migrate  [--repo <path>]     （把舊的全域 checkpoint 搬進 .sdd/）
  * sdd-graph change   --task <n>          （v1 只預留：回 1 not_implemented）
  * sdd-graph figma-diff --docs <dir> [--repo <dir>]
  * ```
+ *
+ * **`--repo` 缺省就是目前的工作目錄**（就地工作）：程式碼直接寫在使用者的
+ * 業務倉庫裡。給了 URL 的舊用法不變——那是把倉庫複製一份到外掛目錄裡工作。
+ * 兩種模式由 `--repo` 的形態決定，解析規則見 `src/runtime/repo-resolver.ts`。
  *
  * **Exit codes** are the contract; the JSON envelope only says what
  * happened:
@@ -68,7 +93,7 @@ import type { RejectionReason, WorkOrder } from './protocol.js';
  * The error codes the host may see on stderr: `invalid_arguments`,
  * `no_checkpoint`, `audience_mismatch`, `invalid_result`, `invalid_payload`,
  * `invalid_order`, `already_completed`, `lock_not_owned`, `not_implemented`,
- * `internal_error`.
+ * `validation_error`, `aborted`, `internal_error`.
  */
 
 /** The command finished; nothing is pending. */
@@ -86,6 +111,13 @@ export interface RunCliOptions {
   checkpointPath?: string;
   /** Branch lock file to use instead of the plugin-root default. */
   lockPath?: string;
+  /**
+   * 舊的全域 checkpoint 庫（`migrate` 用）。
+   *
+   * 預設是外掛根底下的那一份；測試指向臨時目錄——否則測試會動到開發者
+   * 自己正在用的舊庫。
+   */
+  legacyCheckpointPath?: string;
 }
 
 /**
@@ -108,7 +140,14 @@ type WireWorkerResult = z.infer<typeof WireWorkerResultSchema>;
 class CliError extends Error {
   constructor(
     readonly code: string,
-    message: string
+    message: string,
+    /**
+     * 機器可讀的補充資料（會一起放進 error 信封）。
+     *
+     * **部分成功也要結構化**：命令做了一半才失敗時，使用者拿得到
+     * 「已經搬了哪些、還有哪些沒搬」，不必從訊息裡的字句猜。
+     */
+    readonly details?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'CliError';
@@ -148,6 +187,8 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
         return await cmdStatus(args, opts);
       case 'stop':
         return await cmdStop(args, opts);
+      case 'migrate':
+        return await cmdMigrate(args, opts);
       case 'change':
         return cmdChange();
       case 'figma-diff':
@@ -157,7 +198,34 @@ export async function runCli(argv: string[], opts: RunCliOptions = {}): Promise<
     }
   } catch (err) {
     if (err instanceof CliError) {
+      writeErr(
+        envelope('error', {
+          // **`details` 先鋪，`code`/`message` 後蓋**：`details` 是呼叫端給的
+          // 補充資料，它不該有權改掉錯誤碼與錯誤訊息（那會讓宿主讀到
+          // 一個自相矛盾的信封）。
+          ...(err.details ?? {}),
+          code: err.code,
+          message: err.message,
+        })
+      );
+      return EXIT_ERROR;
+    }
+    if (err instanceof SddAbortError) {
+      // **使用者喊停不是插件壞了**：這是使用者自己的決定，退出碼與錯誤碼
+      // 都得跟「內部錯誤」分開，宿主才知道這不是要重試的故障。
       writeErr(envelope('error', { code: err.code, message: err.message }));
+      return EXIT_ERROR;
+    }
+    if (err instanceof RepoResolutionError) {
+      // 路徑寫錯、不是 git 倉庫——那是使用者要改的事，不是內部錯誤。
+      // 復用既有的結構化錯誤機制（`createError`）決定錯誤碼與分類，
+      // 不再長出第四種錯誤形態。
+      //
+      // **`validation_error` 的 recoveryHint 講的是 task 名稱格式**，
+      // 對「`--repo` 的路徑寫錯」是誤導；而 `RepoResolutionError` 的訊息裡
+      // 已經把該怎麼改講清楚了，所以訊息以它為準。
+      const structured = createError(err.code, err.message);
+      writeErr(envelope('error', { code: structured.code, message: structured.message }));
       return EXIT_ERROR;
     }
     writeErr(
@@ -187,11 +255,47 @@ export async function main(): Promise<void> {
 /* commands                                                            */
 /* ------------------------------------------------------------------ */
 
-/** `start --task <n> --repo <url>`: begin a run (or hand back what is pending). */
+/**
+ * `start --task <n> [--repo <path|url>]`: begin a run (or hand back what is pending).
+ *
+ * **`--repo` 缺省就是目前的工作目錄**（就地工作）：程式碼直接寫在使用者的
+ * 業務倉庫裡，運行時狀態寫在 `<repoRoot>/.sdd/` 之下。給了 URL 的舊用法不變——
+ * 那是把倉庫複製一份到外掛目錄裡工作。
+ *
+ * **解析必須在建圖之前**：節點要靠運行上下文知道自己在哪個倉庫裡工作，
+ * 而上下文是模組級單例——晚一步設定，節點就已經用錯的路徑了。
+ */
 async function cmdStart(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
   const threadId = threadIdOf(requireFlag(args, 'task'));
-  const repoUrl = requireFlag(args, 'repo');
+  const repoSpec = args.flags.get('repo') ?? process.cwd();
   const config = configOf(threadId);
+
+  const resolved = resolveRepo(repoSpec, process.cwd());
+  // **就地模式只認目前目錄所在的倉庫**：整個設計的前提是「命令在哪個業務
+  // 倉庫目錄裡執行，就操作那個倉庫的同名 task」。允許 `--repo` 指向另一個
+  // 倉庫會造出兩種壞掉的 run：之後在任何地方都找不到它，而且「在 repo A
+  // 啟動、在 repo B 裡 resume」會把 run 綁到 B 的同名 task 上——模式與
+  // `start` 設的不一樣。
+  if (resolved.mode === 'local') {
+    assertSameRepoAsCwd(resolved.repoRoot);
+  }
+  // **狀態根不得就是業務倉庫根**（見 {@link assertSddHomeSeparate}）：
+  // 那會讓清理刪掉使用者自己的 `tasks/`、`runs/` 目錄。這要在建圖之前
+  // 就擋下來——使用者要改的是環境變數，不是「跑到一半才失敗」。
+  let context: RunContext;
+  try {
+    context = contextOf(resolved);
+  } catch (err) {
+    throw new CliError('validation_error', errorMessage(err));
+  }
+  setRunContext(context);
+
+  // 就地模式不該把本機絕對路徑寫進要進版本庫的 `workflow-state.json` 鏡像：
+  // 寫遠端地址，寫不出來就寫 `local:<目錄名>`。
+  const repoUrl =
+    resolved.mode === 'local' ? localRepoUrl(resolved.repoRoot) : resolved.remoteUrl ?? repoSpec;
+  // `.sdd` 沒被 git 忽略時提醒使用者一句（只提示，不改他的 .gitignore）。
+  const notice = resolved.mode === 'local' ? gitignoreNotice(resolved.repoRoot) : undefined;
 
   return withGraph(opts, async (graph) => {
     const state = await readState(graph, config);
@@ -199,10 +303,10 @@ async function cmdStart(args: ParsedArgs, opts: RunCliOptions): Promise<number> 
     if (pending) {
       // The thread already has work in flight: hand the same order back
       // instead of starting a second run on top of it.
-      return emitInterrupt(pending, threadId, stageOfSnapshot(state));
+      return emitInterrupt(pending, threadId, stageOfSnapshot(state), notice);
     }
     await graph.invoke({ requirementName: threadId, repoUrl } as GraphState, config);
-    return reportOutcome(graph, config, threadId);
+    return reportOutcome(graph, config, threadId, notice);
   });
 }
 
@@ -211,7 +315,7 @@ async function cmdResume(args: ParsedArgs, opts: RunCliOptions): Promise<number>
   const threadId = threadIdOf(requireFlag(args, 'task'));
   const config = configOf(threadId);
 
-  return withGraph(opts, async (graph) => {
+  return withGraphForThread(threadId, opts, async (graph) => {
     const state = await readState(graph, config);
     if (isEmptyState(state)) {
       throw new CliError('no_checkpoint', `no checkpoint for thread ${threadId}`);
@@ -262,7 +366,7 @@ async function cmdComplete(args: ParsedArgs, opts: RunCliOptions): Promise<numbe
   const rawResult = requireFlag(args, 'result');
   const config = configOf(threadId);
 
-  return withGraph(opts, async (graph) => {
+  return withGraphForThread(threadId, opts, async (graph) => {
     const state = await readState(graph, config);
     if (isEmptyState(state)) {
       throw new CliError('no_checkpoint', `no checkpoint for thread ${threadId}`);
@@ -366,7 +470,7 @@ async function cmdApprove(args: ParsedArgs, opts: RunCliOptions): Promise<number
   const rawPayload = requireFlag(args, 'payload');
   const config = configOf(threadId);
 
-  return withGraph(opts, async (graph) => {
+  return withGraphForThread(threadId, opts, async (graph) => {
     const state = await readState(graph, config);
     if (isEmptyState(state)) {
       throw new CliError('no_checkpoint', `no checkpoint for thread ${threadId}`);
@@ -509,7 +613,7 @@ async function cmdStatus(args: ParsedArgs, opts: RunCliOptions): Promise<number>
   const threadId = threadIdOf(requireFlag(args, 'task'));
   const config = configOf(threadId);
 
-  return withGraph(opts, async (graph) => {
+  return withGraphForThread(threadId, opts, async (graph) => {
     const state = await readState(graph, config);
     if (isEmptyState(state)) {
       throw new CliError('no_checkpoint', `no checkpoint for thread ${threadId}`);
@@ -521,24 +625,60 @@ async function cmdStatus(args: ParsedArgs, opts: RunCliOptions): Promise<number>
       pending: pending
         ? { audience: audienceOf(pending.value) ?? 'user', type: typeOf(pending.value) }
         : null,
+      // **分支鎖也要報**：使用者要看得見「現在是誰握著鎖」——
+      // 鎖在哪個檔案、握著的是哪個 task、哪條分支。
+      lock: lockReport(lockPathOf(opts, graph)),
     });
     return EXIT_OK;
   });
+}
+
+/**
+ * 分支鎖的現況（給 `status` 的信封）。
+ *
+ * **鎖的路徑一定要報**：鎖是按倉庫放的（就地模式在 `<倉庫>/.sdd/` 之下，
+ * 克隆模式在外掛根的 `runtime/` 之下），使用者要知道去哪裡看它。
+ */
+function lockReport(lockPath: string): {
+  path: string;
+  running: boolean;
+  taskName?: string;
+  branch?: string;
+  startedAt?: string;
+} {
+  const lock = getLock(lockPath);
+  if (!lock?.running) {
+    return { path: lockPath, running: false };
+  }
+  return {
+    path: lockPath,
+    running: true,
+    taskName: lock.taskName,
+    branch: lock.branch,
+    startedAt: lock.startedAt,
+  };
 }
 
 /** `stop --task <n> [--force]`: release the branch lock, keep everything else. */
 async function cmdStop(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
   const threadId = threadIdOf(requireFlag(args, 'task'));
   const force = args.flags.has('force');
-  const lockPath = opts.lockPath ?? getLockFilePath();
+  const lockPath = opts.lockPath ?? resolveLockPath(threadId);
 
   // The lock is global: releasing a lock another task holds would let a
   // third task work on the same branch.
+  //
+  // **`--force` 也不越界（行為變更）**：以前 `--force` 會把別的 task 握著的
+  // 鎖直接刪掉，那等於替別人中止了他正在跑的那一輪——而且刪掉的是**所有倉庫
+  // 共用的全域鎖**，別的倉庫正在跑的 run 會因此失去保護。
+  // 現在 `--force` 只處理「沒有活著的持有者」的鎖（自己的、壞掉的、已停的）；
+  // 別的 task 還握著就報錯，讓使用者先 `stop --task <那個 task>`。
   const ownership = validateLockOwnership(threadId, lockPath);
-  if (ownership.isLocked && !ownership.isHolder && !force) {
+  if (ownership.isLocked && !ownership.isHolder) {
     throw new CliError(
       'lock_not_owned',
-      `the branch lock is held by ${ownership.holderTaskName ?? 'another task'}`
+      `the branch lock is held by ${ownership.holderTaskName ?? 'another task'}` +
+        '；請先 stop 那個 task，或等它跑完'
     );
   }
 
@@ -550,6 +690,100 @@ async function cmdStop(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
   // The checkpoint and the workspace are kept on purpose: the run can be
   // resumed with `resume`.
   emitResult({ threadId, stopped: true });
+  return EXIT_OK;
+}
+
+/**
+ * `migrate [--repo <path>]`：把舊的全域 checkpoint 搬進業務倉庫的 `.sdd/` 之下。
+ *
+ * **搬運是逐個 thread 判歸屬的，不是整庫複製**：舊庫裡可能躺著好幾個倉庫的
+ * run，整庫複製會把別的倉庫的 run 也搬過來——那正是這次改造要修的問題。
+ * 判準只有一個：舊 thread 的 `repoUrl` 是不是等於這個倉庫的
+ * `remote.origin.url`。
+ *
+ * **沒有遠端地址就一條都不搬**：沒有判準就沒有歸屬，硬搬就是把別的倉庫的 run
+ * 搬過來。舊庫原封不動留著（搬運前會備份一份 `.bak`），剩下的由使用者確認
+ * 後自己清理。
+ *
+ * @throws CliError `validation_error` —— `--repo` 不是一個本機倉庫。
+ */
+async function cmdMigrate(args: ParsedArgs, opts: RunCliOptions): Promise<number> {
+  const repoSpec = args.flags.get('repo') ?? process.cwd();
+  const resolved = resolveRepo(repoSpec, process.cwd());
+  if (resolved.mode !== 'local') {
+    throw new CliError(
+      'validation_error',
+      'migrate 需要一個本機倉庫（狀態要搬進那個倉庫的 .sdd/ 之下）；' +
+        `--repo 給的是遠端網址（${resolved.remoteUrl ?? repoSpec}），請改成倉庫路徑`
+    );
+  }
+  const repoRoot = canonicalRepoRoot(resolved.repoRoot);
+  const legacyDbPath =
+    opts.legacyCheckpointPath ?? path.join(getPluginRoot(), 'runtime', 'checkpoints.sqlite');
+  const targetDbPath = path.join(defaultSddHome(repoRoot), 'checkpoints.sqlite');
+  const remoteUrl = readRemoteOriginUrl(repoRoot);
+
+  const notices: string[] = [];
+
+  // **舊鎖不遷**：那把鎖是全域單例，可能握在別的倉庫的 task 手上——動它就是
+  // 動到別人正在跑的那一輪。只提示，不碰。
+  const legacyLock = getLock(path.join(path.dirname(legacyDbPath), 'branch-runtime-lock.json'));
+  if (legacyLock?.running) {
+    notices.push(
+      `舊的分支鎖仍指向 ${legacyLock.taskName}，請先 stop 那個 task（遷移不會動鎖）`
+    );
+  }
+
+  if (remoteUrl === undefined) {
+    // **沒有遠端地址就無法判定歸屬**：一條都不搬，只把還在舊庫的 thread 報出來。
+    const skipped = await listLegacyThreads(legacyDbPath);
+    notices.unshift('這個倉庫沒有 remote.origin.url，無法判定歸屬，所以一條都沒搬');
+    emitResult({
+      command: 'migrate',
+      migrated: [],
+      skipped,
+      skippedReasons: Object.fromEntries(
+        skipped.map((threadId) => [threadId, '這個倉庫沒有 remote.origin.url，無法判定歸屬'])
+      ),
+      mixed: [],
+      target: targetDbPath,
+      notice: notices.join('；'),
+    });
+    return EXIT_OK;
+  }
+
+  const result = await migrateState({ legacyDbPath, targetDbPath, matchUrl: remoteUrl });
+  if (result.error !== undefined) {
+    // **部分成功也要結構化**：使用者拿得到「已經搬了哪些、還有哪些沒搬」，
+    // 不必從訊息裡的字句猜。
+    throw new CliError('internal_error', result.error, {
+      migrated: result.migrated,
+      skipped: result.skipped,
+      skippedReasons: result.skippedReasons ?? {},
+      mixed: result.mixed ?? [],
+    });
+  }
+
+  if (result.migrated.length === 0) {
+    notices.push('沒有可搬的 thread（都已經搬過了，或剩下的不屬於這個倉庫）');
+  }
+  if ((result.mixed ?? []).length > 0) {
+    notices.push(
+      `有 ${(result.mixed ?? []).length} 條 thread 混了兩種不同的 repoUrl 寫法，` +
+        '沒有搬（請手動處理）'
+    );
+  }
+
+  emitResult({
+    command: 'migrate',
+    migrated: result.migrated,
+    skipped: result.skipped,
+    skippedReasons: result.skippedReasons ?? {},
+    mixed: result.mixed ?? [],
+    target: targetDbPath,
+    ...(result.backupPath === undefined ? {} : { backup: result.backupPath }),
+    notice: notices.join('；'),
+  });
   return EXIT_OK;
 }
 
@@ -703,6 +937,381 @@ async function withGraph<T>(opts: RunCliOptions, fn: (graph: CompiledSddGraph) =
   return fn(buildGraph({ checkpointer: saver, lockPath: opts.lockPath }));
 }
 
+/**
+ * 一個 checkpoint 候選位置。
+ *
+ * **候選不只是「一個路徑」**：命中哪一個，就照哪一個的模式設定運行上下文
+ * （就地 = 使用者的業務倉庫，遠端 = 外掛根）——兩邊的狀態不能互相污染。
+ */
+interface CheckpointCandidate {
+  /** 就地 = 使用者的業務倉庫；遠端 = 外掛的舊位置。 */
+  mode: RepoMode;
+  /** local: 業務倉庫根；remote: 外掛根。 */
+  repoRoot: string;
+  /** 運行時狀態根（checkpoint 與分支鎖都住在它底下）。 */
+  sddHome: string;
+  /** checkpoint 資料庫。 */
+  checkpointPath: string;
+  /** 分支鎖檔。 */
+  lockPath: string;
+  /**
+   * 這個位置為什麼查不了（有的話）。
+   *
+   * **被跳過的位置也要寫進錯誤訊息**：使用者最需要知道的就是
+   * 「你的 task 可能在某個業務倉庫的 `.sdd` 裡，請 cd 到那裡再試」。
+   */
+  unavailable?: string;
+}
+
+/**
+ * 這輪運行的 checkpoint 可能在哪裡。
+ *
+ * **順序有意義**：就地的位置先查，外掛的舊位置後查。
+ *
+ * - 先查就地：同一個倉庫裡的兩輪 run 不該看見對方的 checkpoint，
+ *   而且使用者最可能就是在自己的專案目錄裡下指令。
+ * - 後查舊位置：遠端模式的用法（`--repo <url>` + 之後的 `resume`）不能被
+ *   這次改動打斷——查不到就地位置時必須往回落。
+ *
+ * **cwd 不在 git 倉庫裡時就地位置查不了，但還是列在清單裡**：
+ * 錯誤訊息要告訴使用者「就地的那一份存在哪裡、為什麼沒查」。
+ *
+ * @param cwd - 使用者目前所在的目錄
+ */
+function resolveCheckpointCandidates(cwd: string): CheckpointCandidate[] {
+  const candidates: CheckpointCandidate[] = [];
+
+  const top = gitTopLevel(cwd);
+  if (top !== undefined) {
+    const repoRoot = canonicalRepoRoot(top);
+    // **不是 `<repoRoot>/.sdd` 寫死**：`SDD_GRAPH_SDD_HOME` 要能覆寫狀態根。
+    const sddHome = defaultSddHome(repoRoot);
+    candidates.push({
+      mode: 'local',
+      repoRoot,
+      sddHome,
+      checkpointPath: path.join(sddHome, 'checkpoints.sqlite'),
+      lockPath: path.join(sddHome, 'branch-lock.json'),
+    });
+  } else {
+    // **查不了就地位置，但使用者最需要知道它**：這裡的檔案路徑只是給
+    // 錯誤訊息看的（猜測：倉庫就在 cwd 底下），不是真的會去開它。
+    candidates.push({
+      mode: 'local',
+      repoRoot: '',
+      sddHome: '',
+      checkpointPath: path.join(cwd, '.sdd', 'checkpoints.sqlite'),
+      lockPath: '',
+      unavailable: '目前目錄不在 git 倉庫裡，沒有就地工作的位置可查',
+    });
+  }
+
+  const pluginRoot = getPluginRoot();
+  candidates.push({
+    mode: 'remote',
+    repoRoot: pluginRoot,
+    sddHome: path.join(pluginRoot, 'runtime'),
+    checkpointPath: path.join(pluginRoot, 'runtime', 'checkpoints.sqlite'),
+    lockPath: path.join(pluginRoot, 'runtime', 'branch-runtime-lock.json'),
+  });
+
+  return candidates;
+}
+
+/**
+ * 這個候選位置在錯誤訊息裡怎麼說。
+ *
+ * **被跳過的位置也要列出來**：使用者要知道插件去哪裡找過、為什麼沒查。
+ */
+function describeCandidate(candidate: CheckpointCandidate): string {
+  if (candidate.unavailable) {
+    return `${candidate.checkpointPath}（${candidate.unavailable}）`;
+  }
+  if (!fs.existsSync(candidate.checkpointPath)) {
+    return `${candidate.checkpointPath}（檔案不存在）`;
+  }
+  return candidate.checkpointPath;
+}
+
+/**
+ * 用命中那個候選的運行上下文工作。
+ *
+ * **查不到就拋 `no_checkpoint`，訊息裡列出查過的位置**：使用者要知道插件
+ * 到底去哪裡找過，才好知道要往哪裡放東西。
+ *
+ * @throws CliError `no_checkpoint` —— 兩個位置都沒有這個 thread。
+ */
+async function withGraphForThread<T>(
+  threadId: string,
+  opts: RunCliOptions,
+  fn: (graph: CompiledSddGraph) => Promise<T>
+): Promise<T> {
+  // 測試注入的路徑優先：既有行為（`opts.graph` / `opts.checkpointPath`）不改。
+  if (opts.graph) {
+    return fn(opts.graph);
+  }
+  if (opts.checkpointPath) {
+    return withGraph(opts, fn);
+  }
+
+  const candidates = resolveCheckpointCandidates(process.cwd());
+  const config = configOf(threadId);
+
+  for (const candidate of candidates) {
+    // 這個位置根本查不了（cwd 不在 git 倉庫裡）。
+    if (candidate.unavailable) {
+      continue;
+    }
+    // 沒有檔案就沒有 thread：**不開資料庫**，免得在使用者的倉庫裡憑空造出
+    // 一個 `.sdd/checkpoints.sqlite`。
+    if (!fs.existsSync(candidate.checkpointPath)) {
+      continue;
+    }
+    setRunContext(contextOfCandidate(candidate));
+    const saver = createCheckpointer(candidate.checkpointPath);
+    const graph = buildGraph({ checkpointer: saver, lockPath: opts.lockPath ?? candidate.lockPath });
+    const state = await readState(graph, config);
+    if (!isEmptyState(state)) {
+      return fn(graph);
+    }
+  }
+
+  // 兩個位置都沒有這一輪：上下文回到預設（外掛根的遠端模式），
+  // 別讓剛才探過就地位置留下的上下文留在原地。
+  setRunContext(remoteContext());
+  throw new CliError(
+    'no_checkpoint',
+    `no checkpoint for thread ${threadId} (searched: ${candidates
+      .map((candidate) => describeCandidate(candidate))
+      .join(', ')})`
+  );
+}
+
+/**
+ * 候選位置對應的運行上下文。
+ *
+ * **兩邊不能互相污染**：就地候選用的是業務倉庫的 `.sdd`，遠端候選用的是
+ * 外掛根的 `runtime/`——查到哪一個就照哪一個設。
+ */
+function contextOfCandidate(candidate: CheckpointCandidate): RunContext {
+  if (candidate.mode === 'remote') {
+    return remoteContext();
+  }
+  return {
+    mode: 'local',
+    repoRoot: candidate.repoRoot,
+    sddHome: candidate.sddHome,
+    workspaceBase: getWorkspaceBase(),
+  };
+}
+
+/**
+ * 解析後的倉庫對應的運行上下文。
+ *
+ * **就地與遠端的路徑來自不同的家**：就地模式的狀態在使用者的業務倉庫裡，
+ * 遠端模式的一律在外掛根底下——兩邊不能互相污染。
+ */
+function contextOf(resolved: ResolvedRepo): RunContext {
+  if (resolved.mode === 'local') {
+    // **正規化過的路徑**：鎖檔、run-metadata、回報的 repoPath 必須指向
+    // 同一個物理路徑（macOS 的 `/var` 是 `/private/var` 的符號連結）。
+    const repoRoot = canonicalRepoRoot(resolved.repoRoot);
+    // **必須是 `defaultSddHome()` 的結果**：`getSddHome()` 原樣返回上下文裡的
+    // 值，自己不套 `SDD_GRAPH_SDD_HOME`——不傳等於那個環境變數失效。
+    const sddHome = defaultSddHome(repoRoot);
+    assertSddHomeSeparate(sddHome, repoRoot);
+    return {
+      mode: 'local',
+      repoRoot,
+      sddHome,
+      workspaceBase: getWorkspaceBase(),
+    };
+  }
+  return remoteContext();
+}
+
+/**
+ * 外掛根的遠端模式上下文（未設置上下文時的預設值）。
+ *
+ * **遠端模式的 `repoRoot` 是外掛根**：真正被複製出來的倉庫還不存在，
+ * 它要等複製完才知道——但節點要的是「這輪運行在哪裡工作」，所以先給外掛根。
+ */
+function remoteContext(): RunContext {
+  const pluginRoot = getPluginRoot();
+  return {
+    mode: 'remote',
+    repoRoot: pluginRoot,
+    sddHome: path.join(pluginRoot, 'runtime'),
+    workspaceBase: getWorkspaceBase(),
+  };
+}
+
+/**
+ * 就地模式的目標倉庫必須就是目前目錄所在的倉庫。
+ *
+ * **兩個路徑正規化後要一樣**：正規化（`canonicalRepoRoot`）讓 macOS 的
+ * `/var` 與 `/private/var` 不會被當成兩個倉庫；比較的是**倉庫根**，
+ * 所以倉庫裡的子目錄（`--repo .`、cwd 在 `src/` 底下）都算同一個倉庫。
+ *
+ * @param repoRoot - `--repo` 解析出來的倉庫根
+ * @throws CliError `validation_error` —— 目標不是目前目錄所在的倉庫。
+ */
+function assertSameRepoAsCwd(repoRoot: string): void {
+  const cwdTop = gitTopLevel(process.cwd());
+  if (cwdTop !== undefined && canonicalRepoRoot(cwdTop) === canonicalRepoRoot(repoRoot)) {
+    return;
+  }
+  throw new CliError(
+    'validation_error',
+    '就地模式要求在業務倉庫目錄裡執行；請 cd 到那個倉庫後省略 --repo' +
+      `（--repo 指向 ${repoRoot}，與目前目錄的倉庫不同）`
+  );
+}
+
+/**
+ * 這輪運行的分支鎖在哪裡。
+ *
+ * **鎖在哪裡，決定了這輪 run 是哪一種**：就地模式的鎖在自己的 `.sdd/` 之下，
+ * 遠端模式的鎖在外掛根的 `runtime/` 之下。`stop` 不接收 `--repo`，所以只能
+ * 靠候選的歸屬判斷。
+ *
+ * **三段規則，順序有意義**：
+ * 1. 握著這個 task 的鎖 → 就是它；
+ * 2. 否則取**第一個鎖檔存在**的候選 → 錯誤訊息講的是「你現在這個倉庫」
+ *    的那把鎖，而不是別的倉庫的；
+ * 3. 一個都不存在 → 取第一個可用的候選（回報「沒有鎖」用）。
+ *
+ * **絕不無條件回落到全域鎖**：全域鎖是所有倉庫共用的，動它就是動到別的
+ * 倉庫正在跑的那一輪——使用者只是在自己的專案目錄裡下了 `stop`。
+ */
+function resolveLockPath(threadId: string): string {
+  const candidates = resolveCheckpointCandidates(process.cwd());
+  const usable = candidates.filter((candidate) => !candidate.unavailable);
+
+  for (const candidate of usable) {
+    const lock = getLock(candidate.lockPath);
+    if (lock?.running && lock.taskName === threadId) {
+      return candidate.lockPath;
+    }
+  }
+  for (const candidate of usable) {
+    if (fs.existsSync(candidate.lockPath)) {
+      return candidate.lockPath;
+    }
+  }
+  return (usable[0] ?? candidates[candidates.length - 1]).lockPath;
+}
+
+/**
+ * 這個倉庫的遠端網址（`remote.origin.url`）。
+ *
+ * **沒有遠端就回傳 undefined**：遷移靠它判定歸屬，沒有判準就不能搬
+ * （見 `cmdMigrate`）。
+ *
+ * @param repoRoot - 業務倉庫根
+ * @returns 遠端網址；倉庫沒有遠端（或 git 失敗）時是 undefined
+ */
+function readRemoteOriginUrl(repoRoot: string): string | undefined {
+  try {
+    const url = execFileSync('git', ['-C', repoRoot, 'config', '--get', 'remote.origin.url'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, LC_ALL: 'C' },
+    }).trim();
+    return url === '' ? undefined : url;
+  } catch {
+    // 沒有遠端（或 git 失敗）。
+    return undefined;
+  }
+}
+
+/**
+ * 就地模式寫進 state 的倉庫標記。
+ *
+ * **不能是本機絕對路徑**：那份鏡像要進版本庫，寫進去的是每台機器都不一樣的
+ * 路徑。寫遠端地址；沒有遠端（或遠端本身就是一個本機路徑）就寫
+ * `local:<目錄名>`——至少看得出是哪個專案。
+ *
+ * @param repoRoot - 業務倉庫根
+ */
+function localRepoUrl(repoRoot: string): string {
+  const url = readRemoteOriginUrl(repoRoot);
+  if (url !== undefined && !looksLikeLocalPath(url)) {
+    return url;
+  }
+  return `local:${path.basename(repoRoot)}`;
+}
+
+/**
+ * 這個 remote url 是不是一個本機檔案系統路徑？
+ *
+ * **`remote.origin.url` 也可能指著本機的一個目錄**（`/Users/x/repos/foo`、
+ * `file:///Users/x/repos/foo`、相對路徑……）。那樣的絕對路徑一樣不該進
+ * 版本庫——這正是這個函式要避免的事。
+ *
+ * 認得的三種形狀：`file://`、Windows 磁碟路徑（`C:\...`）、以及沒有 scheme
+ * 也沒有 scp 語法（`git@host:path` 之外）的路徑。
+ */
+function looksLikeLocalPath(url: string): boolean {
+  if (url.startsWith('file://')) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]/.test(url)) {
+    return true;
+  }
+  if (url.startsWith('/') || url.startsWith('./') || url.startsWith('../')) {
+    return true;
+  }
+  // 沒有 `:` = 沒有 scheme、也不是 `git@host:path` → 是檔案系統路徑。
+  return !url.includes(':');
+}
+
+/**
+ * `.sdd` 沒被 git 忽略時給使用者的提示。
+ *
+ * **只提示，不代勞**：`.gitignore` 是受版本控制的檔案，插件偷偷改它會污染
+ * 使用者的 commit。要不要忽略 `.sdd/` 是使用者自己的決定。
+ *
+ * @param repoRoot - 業務倉庫根
+ * @returns 提示文字；已經被忽略時為 undefined。
+ */
+function gitignoreNotice(repoRoot: string): string | undefined {
+  // **問的是目錄**（`.sdd/`）：忽略規則裡的 `/.sdd/` 只匹配目錄，
+  // 用檔案的路徑去問，git 會說「沒被忽略」——那是錯的。
+  return isIgnoredByGit(repoRoot, '.sdd/') ? undefined : '請把 /.sdd/ 加進 .gitignore';
+}
+
+/**
+ * 這個路徑有沒有被 git 的忽略規則蓋到？
+ *
+ * **問 git，不要自己解析 `.gitignore`**：忽略規則可以寫在好幾個檔案裡，
+ * 還有 `.git/info/exclude` 與全域的 `core.excludesFile`——自己解析一定漏。
+ *
+ * **路徑要不要帶斜線有語意**：只匹配目錄的規則（`/.sdd/`）配的是目錄，
+ * 拿檔案的路徑去問，git 會說「沒被忽略」。要問目錄就給它一個尾斜線。
+ *
+ * `git check-ignore` 對「沒被忽略」回傳退出碼 1（不是錯誤），所以退出碼
+ * 1 與其他失敗都當成「沒被忽略」：多一句提示無害，少一句才會漏掉真正的問題。
+ *
+ * **「git 失敗」也落在同一邊**：git 不在 PATH、目錄不是倉庫、逾時——
+ * 全都回 false（當成沒被忽略），因為使用者寧可多看到一句提醒，
+ * 也不要以為 `.sdd/` 已經被忽略而把它 commit 進去。
+ *
+ * @param repoRoot - 倉庫根
+ * @param relativePath - 相對於倉庫根的路徑
+ */
+function isIgnoredByGit(repoRoot: string, relativePath: string): boolean {
+  try {
+    execFileSync('git', ['-C', repoRoot, 'check-ignore', relativePath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, LC_ALL: 'C' },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The thread id of a task (= the normalized task name). */
 function threadIdOf(task: string): string {
   return normalizeTaskName(task);
@@ -821,20 +1430,24 @@ function errorMessage(err: unknown): string {
  * The final state is always read from `getState()`: `invoke()` returns
  * `undefined` when the last node wrote nothing, so its return value is not a
  * reliable source for the state.
+ *
+ * @param notice - 要附在信封上的提示（例如 `.sdd` 沒被 git 忽略）。
  */
 async function reportOutcome(
   graph: CompiledSddGraph,
   config: { configurable: { thread_id: string } },
-  threadId: string
+  threadId: string,
+  notice?: string
 ): Promise<number> {
   const state = await readState(graph, config);
   // The mirror is refreshed on every step that moved the run.
   syncMirror(state.values);
   const pending = firstInterrupt(state);
+  const stage = stageOfSnapshot(state);
   if (pending) {
-    return emitInterrupt(pending, threadId, stageOfSnapshot(state));
+    return emitInterrupt(pending, threadId, stage, notice);
   }
-  emitResult({ stage: stageOfSnapshot(state), threadId });
+  emitResult(notice === undefined ? { stage, threadId } : { stage, threadId, notice });
   return EXIT_OK;
 }
 
@@ -866,7 +1479,12 @@ function syncMirror(values: Record<string, unknown>): void {
   if (requirementName === '' || repoPath === '') return;
 
   try {
-    new ArtifactStore(requirementName, repoPath).sync(values as unknown as SddState);
+    // **就地模式的鏡像不得帶本機絕對路徑**：`workflow-state.json` 要進版本庫，
+    // 寫進去的是每台機器都不一樣的路徑（`repoUrl` 已經用同樣的理由處理過：
+    // 寫遠端地址，寫不出來就寫 `local:<目錄名>`）。鏡像的**位置**還是要用
+    // 真路徑找（`ArtifactStore` 拿它算 docs 目錄），只是文件裡不留路徑。
+    const mirror = isLocalMode() ? { ...values, repoPath: '' } : values;
+    new ArtifactStore(requirementName, repoPath).sync(mirror as unknown as SddState);
   } catch (err) {
     throw new CliError(
       'internal_error',
@@ -877,8 +1495,17 @@ function syncMirror(values: Record<string, unknown>): void {
   }
 }
 
-/** Print an interrupt envelope and return the exit code. */
-function emitInterrupt(pending: PendingInterrupt, threadId: string, stage: string): number {
+/**
+ * Print an interrupt envelope and return the exit code.
+ *
+ * @param notice - 要附在信封上的提示（例如 `.sdd` 沒被 git 忽略）。
+ */
+function emitInterrupt(
+  pending: PendingInterrupt,
+  threadId: string,
+  stage: string,
+  notice?: string
+): number {
   const audience = audienceOf(pending.value);
   if (!audience) {
     // Every interrupt payload has to carry an audience. A payload without one
@@ -894,6 +1521,7 @@ function emitInterrupt(pending: PendingInterrupt, threadId: string, stage: strin
       stage,
       payload: pending.value,
       interruptId: pending.id,
+      ...(notice === undefined ? {} : { notice }),
     })
   );
   return EXIT_INTERRUPT;
