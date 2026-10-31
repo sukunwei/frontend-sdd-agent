@@ -14,29 +14,54 @@ import { resetRunContext, setRunContext } from '../src/runtime/run-context.js';
 import type { Task } from '../src/state/types.js';
 
 /**
- * 圖跑的時候，插件自己跑過的 git 指令（argv 陣列）。
+ * 插件自己發出的子行程呼叫（命令 + 參數）。
  *
- * **這是「就地模式一個 git 指令都沒跑」的證據**：mock 只記錄、不改行為，
- * 所以被記下來的每一條都是插件真的對使用者的業務倉庫下過的指令。
+ * **這是「就地模式一個子行程都沒跑」的證據**，而且它不能是一句空話：
+ *
+ * - 記的是**所有**子行程入口（`execFileSync` / `execFile` / `execSync` /
+ *   `exec` / `spawn` / `spawnSync`）與**所有**命令，不只 `git`——插件哪天
+ *   改用 `spawnSync`、換了別的執行檔、或是拼了 shell 字串，都還抓得到。
+ * - mock 只記錄、不改行為，所以被記下來的每一條都是插件真的跑過的指令。
+ * - 遠端模式那個測試會順便斷言「記錄器抓得到東西」：**記錄器一旦失效，
+ *   那個測試會紅**，就地模式的斷言就不會變成永遠為真的空話。
  */
-const { gitCalls } = vi.hoisted(() => ({ gitCalls: [] as string[][] }));
+const { subprocessCalls } = vi.hoisted(() => ({ subprocessCalls: [] as string[][] }));
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
+
+  /** 記一條子行程呼叫：命令本體 + （有的話）argv。 */
+  const record = (command: unknown, args: unknown): void => {
+    const head = String(command);
+    subprocessCalls.push(
+      Array.isArray(args) ? [head, ...args.map((arg) => String(arg))] : [head]
+    );
+  };
+
+  /** 包一層：先記錄，再照原樣呼叫。 */
+  const wrap =
+    (fn: unknown) =>
+    (...args: unknown[]): unknown => {
+      record(args[0], args[1]);
+      return (fn as (...a: unknown[]) => unknown)(...args);
+    };
+
   return {
     ...actual,
-    execFileSync: (file: string, args: string[], options?: unknown) => {
-      if (file === 'git') gitCalls.push(args);
-      return (actual.execFileSync as (...a: unknown[]) => unknown)(file, args, options);
-    },
+    execFileSync: wrap(actual.execFileSync),
+    execFile: wrap(actual.execFile),
+    execSync: wrap(actual.execSync),
+    exec: wrap(actual.exec),
+    spawnSync: wrap(actual.spawnSync),
+    spawn: wrap(actual.spawn),
   };
 });
 
 /**
  * **測試自己**用的 git 呼叫（沒有被 mock）。
  *
- * 這樣一來 `gitCalls` 裡面記到的每一條都是**插件**跑的命令——測試自己為了
- * 布置場景而跑的 git 不會混進來，「插件一個 git 指令都沒跑」這個斷言才是真的。
+ * 這樣一來 `subprocessCalls` 裡面記到的每一條都是**插件**跑的命令——測試自己
+ * 為了布置場景而跑的 git 不會混進來，「插件一個子行程都沒跑」這個斷言才是真的。
  */
 let realExecFileSync: typeof ExecFileSync;
 
@@ -294,14 +319,14 @@ describe('就地模式不做任何自動回滾', () => {
       sddHome: path.join(repo, '.sdd'),
       workspaceBase: path.join(tmp, 'tasks'),
     });
-    gitCalls.length = 0;
+    subprocessCalls.length = 0;
   });
 
   afterEach(() => {
     resetRunContext();
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(tmp, { recursive: true, force: true });
-    gitCalls.length = 0;
+    subprocessCalls.length = 0;
   });
 
   it('連續失敗兩次：不打 tag、不 reset、使用者的未提交改動一字未動', async () => {
@@ -322,8 +347,9 @@ describe('就地模式不做任何自動回滾', () => {
     const payload = await pending(g, cfg);
     expect(payload.type).toBe('tdd_rollback');
 
-    // **插件一個 git 指令都沒跑**：沒有 tag、沒有 reset、沒有 status
-    expect(gitCalls).toEqual([]);
+    // **插件一個子行程都沒跑**：沒有 git、沒有 tag、沒有 reset、沒有任何
+    // 別的執行檔（記錄器抓的是所有子行程入口與所有命令，不只 `git`）
+    expect(subprocessCalls).toEqual([]);
 
     // 沒有回滾點：任務起始的 tag 從來沒有被建立
     expect(tagsOf(repo).filter((tag) => tag.startsWith('sdd/task/'))).toEqual([]);
@@ -356,6 +382,29 @@ describe('就地模式不做任何自動回滾', () => {
     expect(message).toContain('回滾');
     expect(message).toContain('請手動處理');
   });
+
+  it('放棄這個 task 的那道閘門（tdd_blocked）也要說明壞代碼留在哪裡', async () => {
+    const { g, cfg } = tddGraph(repo, tmp, 'thr-local-blocked');
+
+    // 兩次失敗 → 回滾閘門
+    await driveToRollbackGate(g, cfg, repo);
+    // 使用者說「再試一次」
+    await g.invoke(new Command({ resume: { action: 'wait' } }), cfg);
+    // 第三次失敗 → 放棄這個 task 的閘門
+    developerWorks(repo, 3);
+    await developerDone(g, cfg);
+    await specFails(g, cfg);
+
+    const payload = await pending(g, cfg);
+    expect(payload.type).toBe('tdd_blocked');
+
+    // **這一道閘門沒有 `rollback` 欄位，但它恰恰是用戶下次回來唯一會看到的
+    // 那一道**——他必須知道壞代碼還留在自己的倉庫裡。
+    const message = `${payload.question ?? ''} ${payload.note ?? ''}`;
+    expect(message).toContain('就地模式');
+    expect(message).toContain('回滾');
+    expect(message).toContain('請手動處理');
+  });
 });
 
 /**
@@ -373,14 +422,14 @@ describe('遠端模式仍然打 tag 並回滾', () => {
     repo = createBusinessRepo('sdd-remote-rollback-');
     // 遠端模式：預設的運行上下文就是 remote
     resetRunContext();
-    gitCalls.length = 0;
+    subprocessCalls.length = 0;
   });
 
   afterEach(() => {
     resetRunContext();
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(tmp, { recursive: true, force: true });
-    gitCalls.length = 0;
+    subprocessCalls.length = 0;
   });
 
   it('仍然打任務起始的 tag，並把壞掉的程式碼還原回去', async () => {
@@ -396,5 +445,18 @@ describe('遠端模式仍然打 tag 並回滾', () => {
       false
     );
     expect(payload.rollback).toBe('done');
+
+    // **遠端模式的閘門訊息一字未變**（就地模式的說明不得跑進來）
+    expect(payload.question).toBeUndefined();
+
+    // **記錄器是活的**：遠端模式裡插件確實跑過 `git reset --hard`。
+    // 這條斷言讓「記錄器失效」這件事會紅——就地模式那條
+    // 「插件一個子行程都沒跑」的斷言才不會變成一句空話。
+    expect(
+      subprocessCalls.some(
+        (call) =>
+          call[0] === 'git' && call.includes('reset') && call.includes('--hard')
+      )
+    ).toBe(true);
   });
 });

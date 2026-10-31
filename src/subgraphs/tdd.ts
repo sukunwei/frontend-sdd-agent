@@ -102,13 +102,14 @@ export async function tddSubgraph(state: GraphState): Promise<NodeOutcome> {
     // What the rollback did rides along with the gate: the user has to know
     // whether the broken code is still on disk before answering.
     const rollback = gate.rollback !== undefined ? { rollback: gate.rollback } : {};
-    // **就地模式的閘門要多說一句。** 那個 `skipped` 不只是一個狀態碼：壞代碼
-    // 還在使用者的業務倉庫裡，插件不會替他收拾，所以這句話得由閘門帶到使用者
-    // 面前（`question` 是會被 host 念出來給使用者聽的那一段）。
-    const localQuestion =
-      isLocalMode() && gate.rollback === 'skipped'
-        ? { question: LOCAL_NO_ROLLBACK_MESSAGE }
-        : {};
+    // **就地模式的每一道閘門都要多說一句。** 壞代碼還在使用者的業務倉庫裡，
+    // 插件不會替他收拾，所以這句話得由閘門帶到使用者面前（`question` 是會被
+    // host 念出來給使用者聽的那一段）。
+    //
+    // **不只是回滾那一道門。** `tdd_blocked`（第三次失敗、這一輪就此放棄）
+    // 那道門沒有 `rollback` 欄位——但它恰恰是「從此不會再有人碰這個倉庫」的
+    // 那一道：用戶下次回來只看到它，卻不知道壞代碼還留在自己的倉庫裡。
+    const localQuestion = isLocalMode() ? { question: LOCAL_NO_ROLLBACK_MESSAGE } : {};
     const given = readGateAnswer(state);
     if (given === undefined) {
       const answer = interrupt({
