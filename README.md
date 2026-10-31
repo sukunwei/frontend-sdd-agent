@@ -8,6 +8,8 @@
 
 - [這是什麼](#這是什麼)
 - [快速開始：在一個新專案裡用起來](#快速開始在一個新專案裡用起來)
+- [兩種工作模式](#兩種工作模式)
+- [從舊版本遷移](#從舊版本遷移)
 - [目標專案要準備什麼](#目標專案要準備什麼)
 - [七個階段](#七個階段)
 - [`/sdd-graph:*` 指令](#sdd-graph-指令)
@@ -40,7 +42,7 @@
                     │
                     ▼
              LangGraph + SqliteSaver
-               確定性節點就地執行（bootstrap / verify / git / parse）
+               確定性節點直接執行（bootstrap / verify / git / parse）
                需要人腦的節點 = interrupt（audience: user）
                需要動手的工作單 = interrupt（audience: host）
 ```
@@ -112,7 +114,11 @@ claude plugin install sdd-graph@sdd-graph
 
 > **改了外掛之後不用重裝。** 目錄來源的 marketplace 是**直接從那個資料夾讀**的
 > （`claude plugin list` 會寫 `Read from: <目錄>`）。改了外掛之後**重開會話**
-> （或 `/reload-plugins`）就會生效。
+> （或 `/reload-plugins`）就會生效 —— 改 `commands/*.md`、`prompts/*.md` 也一樣，
+> 會話載入的就是源碼目錄裡的那幾個檔案。
+>
+> **萬一重開會話後 `/sdd-graph:start` 不見了**：用 `/plugin` → marketplace `sdd-graph`
+> → reinstall 兜底。
 
 ### 步驟 3 — 確認裝好了
 
@@ -143,16 +149,25 @@ claude plugin list | grep -A 4 sdd-graph
 開一個新的 Claude Code 會話，**cd 到你的專案**，然後：
 
 ```
-/sdd-graph:start --task my-feature --repo https://github.com/you/your-app.git
+/sdd-graph:start --task my-feature
 ```
 
 `--task` 是這一輪的名字（會被正規化成 kebab-case，同時是 thread id、branch 名稱
-`task/<name>` 與需求文件目錄 `docs/<name>/` 的來源）。`--repo` 是要做的那個 repo。
+`task/<name>` 與需求文件目錄 `docs/<name>/` 的來源）。
+
+**`--repo` 是選用的**，它決定「在哪裡幹活」：
+
+| `--repo` | 模式 | 程式碼與 `docs/<name>/` 落在 | 運行時狀態落在 |
+|---|---|---|---|
+| 省略（**預設**） | **就地工作** | 你現在所在的這個倉庫 | `<倉庫>/.sdd/` |
+| `<url>`（含 `file://`） | 克隆模式（舊的用法） | `<外掛目錄>/workspace/tasks/my-feature/repo` 這份副本 | `<外掛根>/runtime/` |
+
+兩種模式的完整差別見 [兩種工作模式](#兩種工作模式)。
 
 接下來會發生什麼：
 
-1. 圖在**外掛的工作區**裡 clone 那個 repo（`<外掛目錄>/workspace/tasks/my-feature/repo`），
-   開一條 `task/my-feature` 分支，並且**拿住全域的分支鎖**。
+1. 圖準備好工作分支（就地模式：在**你的**倉庫裡切出 `task/my-feature`；克隆模式：在
+   副本裡 clone + 切分支），並且**拿住分支鎖**（就地模式的鎖是那個倉庫自己的）。
 2. 圖停在 `collect_prd`，**一次問你三件事**：PRD（路徑或文字）、設計（Figma 連結或
    文字描述）、其他文件（選填）。需求是使用者給的，不是模型編的。細節見
    [`collect_prd`：一次問完三件事](#collect_prd一次問完三件事)。
@@ -165,27 +180,123 @@ claude plugin list | grep -A 4 sdd-graph
 
 ### 步驟 5 — 一輪下來會留下什麼
 
-- **在你原本的 repo 裡**：`task/my-feature` 分支上有 `docs/my-feature/` 底下的
+**就地模式（預設）**：
+
+- **在你的 repo 裡**：`task/my-feature` 分支上有 `docs/my-feature/` 底下的
   `prd.md`、`design.md`（有文字描述的設計時）、`refs/*`（有其他文件時）、
   `discovery.md`、`spec.md`、`e2e-plan.csv`、`tasks.md`、
-  `workflow-state.json`、`verify/*.log`，以及實作出来的程式碼與測試。
-  這些會被 commit 在那條分支上（`git push` 失敗不影響流程，只是分支留在本地）。
+  `workflow-state.json`、`verify/*.log`，以及實作出來的程式碼與測試。
+  **外掛不會替你 commit 或 push** —— 產物留在那條分支上，等你看過再自己提交、合併。
+- **在你的 repo 裡**：`.sdd/`（`checkpoints.sqlite` 這一輪的進度、`branch-lock.json`
+  這個倉庫的分支鎖）。這是**運行時狀態，建議加進 `.gitignore`**（插件只提示，不代勞）。
+
+**克隆模式（`--repo <url>`）**：
+
+- **在外掛目錄的副本裡**：同樣的 `docs/my-feature/` 與程式碼，但它們在
+  `<外掛目錄>/workspace/tasks/my-feature/repo` 這份**副本**裡。那條分支會被推上去；
+  推不上去也不影響流程，只是分支留在本地。
 - **在外掛目錄裡**：`workspace/tasks/my-feature/`（clone 與 metadata）、
   `runtime/checkpoints.sqlite`（這一輪的進度）、`runtime/branch-runtime-lock.json`
   （全域的分支鎖）。
 
 ---
 
+## 兩種工作模式
+
+`sdd-graph` 有兩種「在哪裡幹活」的模式。**預設是就地工作**。
+
+|  | **就地工作（預設）** | **克隆模式** |
+|---|---|---|
+| 怎麼啟動 | 在業務倉庫目錄裡執行 `/sdd-graph:start --task <name>`（**省略 `--repo`**） | `/sdd-graph:start --task <name> --repo <url>`（含 `file://`） |
+| 程式碼寫在哪 | **你現在所在的倉庫**，`task/<name>` 分支上 | `<外掛根>/workspace/tasks/<name>/repo` 這份副本 |
+| 需求文件寫在哪 | `<業務倉庫>/docs/<name>/`（**進版本庫**） | `<副本>/docs/<name>/` |
+| checkpoint | `<業務倉庫>/.sdd/checkpoints.sqlite` | `<外掛根>/runtime/checkpoints.sqlite` |
+| 分支鎖 | `<業務倉庫>/.sdd/branch-lock.json`（**按倉庫**） | `<外掛根>/runtime/branch-runtime-lock.json`（**全域**） |
+| 工作區有未提交的改動時 | 停下來問你（見下） | 副本是新的，乾淨 |
+
+**就地模式為什麼是預設**：外掛本來就應該在你自己的專案裡幹活。舊的「clone 一份到
+外掛目錄」的做法會讓你 review 不到真正的產物、也讓你多一份要同步的副本 —— 而
+`docs/<name>/` 與程式碼分家，「需求文件跟著程式碼一起進版本庫」這件事就不成立。
+
+### 就地模式不做的事
+
+就地模式在**你的**倉庫裡動手，所以有一堆事情它**故意不做**。知道這些，
+你才知道什麼要自己來：
+
+- **不自動 commit / push**：外掛的圖與 CLI 自己**不執行 `git commit`、不執行
+  `git push`** —— 什麼該進版本庫、要不要推上遠端，由你決定。跑完你停在
+  `task/<name>` 分支上，產物（程式碼、`docs/<name>/`）留在那裡等你 review 之後
+  自己提交、合併。（工作單的工人會照 `prompts/developer.md` 的規則把自己的改動
+  commit 在那條分支上；**推上遠端與合併回你的主分支永遠是你的動作**。）
+- **不自動回滾**：task 連續失敗兩次時，圖**不會**把你的程式碼還原 —— **壞代碼原樣
+  留在你的倉庫裡**，等你手動收拾。（克隆模式會在**第二次**失敗時 `git reset --hard`
+  回到 task 的起點；就地模式連這件事都沒有，第三次失敗是 `tdd_blocked` 閘門，
+  也不回滾。）就地模式的閘門訊息會直接寫明「就地模式不做任何自動回滾」。
+- **不打 `sdd/task/*` tag**：沒有回滾點就不需要 tag，你的倉庫裡不會多出外掛的 ref。
+- **不改你的 `.gitignore`**：`.sdd/` 沒被忽略時，輸出裡給一行提示，要你把
+  `/.sdd/` 加進 `.gitignore`；**不代勞**寫你的檔案。
+- **不 stash 你的改動**：工作區有**已跟蹤文件**被改過時會停下來問你
+  （`dirty_worktree` 閘門）：`proceed` = **留在當前分支上繼續**（外掛不切分支、
+  你的改動原封不動），`abort` = 中止這一輪。**未跟蹤的檔案不算髒**，不攔你。
+- **不刪你的東西**：`reset` 只清 `.sdd/` 底下這個 task 的運行時狀態；
+  `docs/<name>/`、分支、程式碼都不動 —— 那些產物要你自己收拾。
+
+### 行為變更（從舊版升上來）
+
+1. **`--repo <本地路徑>` 的語義變了**：以前是「把這個路徑 clone 一份到外掛目錄」，
+   現在是「**就地工作**」（在**那個**倉庫裡幹活）。要保留舊行為請改用 `file://`
+   前綴（`--repo file:///絕對/路徑`）。
+2. **`--repo` 指向 cwd 之外的本地倉庫會被拒絕**（就地模式要求在業務倉庫目錄裡執行）：
+   錯誤訊息是「就地模式要求在業務倉庫目錄裡執行」。那條路徑會造成「啟動了卻再也
+   找不到」的 run —— 在 repo A 啟動、在 repo B 裡 resume，這輪 run 會被綁到 B 的
+   同名 task 上，而 A 裡再也沒有它。
+3. **`stop --force` 不再能釋放別的 task 持有的鎖**：別的活著的 task 握著鎖時，
+   `stop` 會報錯（`lock_not_owned`），請先把那個 task 停掉
+   （`sdd-graph stop --task <那個 task>`）。以前 `--force` 能把別的 task 的鎖刪掉，
+   那等於替別人中止了他正在跑的那一輪；而鎖現在是**按倉庫**的，搶錯倉庫的鎖更危險。
+
+---
+
+## 從舊版本遷移
+
+舊版本把 checkpoint 放在外掛根底下一份**全域**的庫（`runtime/checkpoints.sqlite`），
+兩個倉庫裡同名 task 的 run 會互相蓋掉。就地模式把狀態搬進每個倉庫自己的 `.sdd/`，
+所以舊的進度要搬過去：
+
+```bash
+sdd-graph migrate --repo <你的業務倉庫路徑>
+```
+
+（`--repo` 省略時用目前的工作目錄；給 URL 會被拒絕 —— 狀態要搬進**本機**倉庫的
+`.sdd/` 之下。）
+
+`migrate` 做的事：
+
+- **逐個 thread 判歸屬**：舊 thread 的 `repoUrl` 跟這個倉庫的 `remote.origin.url`
+  一致才搬。不一致的**不搬**，會列在輸出的 `skipped` 裡並附上原因。
+- **舊庫先備份成 `<舊庫>.bak`，舊庫本身不刪** —— 確認搬好了再自己清理。
+- **一個 thread 混了兩個倉庫的 checkpoint → 不搬**（搬整條等於把別個倉庫的進度一起
+  搬過來），列在輸出的 `mixed` 裡，請手動處理。
+- **這個倉庫沒有 `remote.origin.url` → 一條都不搬**（沒有判準就沒有歸屬），
+  舊庫裡還在的 thread 全部列在 `skipped` 裡。
+- **舊的分支鎖不遷**：那把鎖是全域單例，可能握在別的倉庫的 task 手上 —— 遷移只提示
+  （「舊的分支鎖仍指向 X，請先 stop 那個 task」），不碰它。
+
+輸出是 JSON 信封：`migrated`（搬過去的 thread）、`skipped` 與 `skippedReasons`
+（沒搬的與原因）、`mixed`、`target`（新庫的位置）、`backup`（備份路徑）。
+
+---
+
 ## 目標專案要準備什麼
 
-`sdd-graph` 會**真的** clone 你的專案、真的跑你的工具鏈。所以目標 repo 要符合：
+`sdd-graph` 會**真的**跑你的工具鏈；克隆模式還會**真的** clone 你的專案。所以目標 repo 要符合：
 
 | 需要 | 說明 |
 |---|---|
-| **是個 git repo** | 能被 clone（https／ssh／`file://`／本機路徑都可以）。不需要先有 `main` 分支以外的東西。 |
-| **四道關卡的工具** | 驗證階段會在 clone 出來的 repo 裡跑這四個指令（**版本寫死在 `src/nodes/verify-checks.ts`**）：<br>`npx tsc --noEmit` ／ `npx eslint . --ext .ts,.tsx --fix` ／ `npx jest --passWithNoTests --no-coverage` ／ `npx playwright test` |
+| **是個 git repo** | 就地模式：你的專案本身就得是 git repo（外掛就在它裡工作）。克隆模式：能被 clone（https／ssh／`file://`／本機路徑都可以）。不需要先有 `main` 分支以外的東西。 |
+| **四道關卡的工具** | 驗證階段會在**目標 repo**（就地模式 = 你的倉庫；克隆模式 = 副本）裡跑這四個指令（**版本寫死在 `src/nodes/verify-checks.ts`**）：<br>`npx tsc --noEmit` ／ `npx eslint . --ext .ts,.tsx --fix` ／ `npx jest --passWithNoTests --no-coverage` ／ `npx playwright test` |
 | **eslint 8** | `--ext` 這個選項在 eslint 9 已被移除。專案裡要有 `eslint`（v8）與一份設定檔。 |
-| **可以 commit** | 會話會把工作 commit 在 `task/<name>` 分支上。 |
+| **可以 commit** | 工人（會話）會把工作 commit 在 `task/<name>` 分支上；**外掛自己不 commit、不 push**。 |
 | **（選配）Figma MCP** | 你在 PRD 階段給了 Figma 網址時，會話會用 Figma MCP 抓設計資源。 |
 
 > **想改關卡的指令？** v1 把它寫死了 —— 這是刻意的：那四道關卡就是這個外掛的
@@ -338,13 +449,15 @@ flowchart TD
 
 | 指令 | 作用 |
 |---|---|
-| `/sdd-graph:start --task <name> --repo <url>` | 開始一輪：跑圖、依退出碼分支，一路問人或幹活到結束 |
-| `/sdd-graph:resume --task <name>` | 從 checkpoint **重發同一張**未完成的工作單（換會話也能接著做） |
+| `/sdd-graph:start --task <name> [--repo <url>]` | 開始一輪：跑圖、依退出碼分支，一路問人或幹活到結束。**省略 `--repo` ＝ 就地工作**（要在業務倉庫目錄裡執行）；給了 URL ＝ 克隆模式 |
+| `/sdd-graph:resume --task <name>` | 從 checkpoint **重發同一張**未完成的工作單（換會話也能接著做）。**要 cd 到那一輪所在的目錄** |
 | `/sdd-graph:status --task <name>` | **只讀**：目前階段、待處理的中斷、分支鎖。不推進任何階段 |
-| `/sdd-graph:stop --task <name>` | 釋放分支鎖；**保留** checkpoint 與工作區 |
+| `/sdd-graph:stop --task <name>` | 釋放分支鎖；**保留** checkpoint 與工作區。`--force` **不再能搶別的 task 的鎖** |
 | `/sdd-graph:change --task <name>` | v1 只預留：回 `not_implemented`，不會默默忽略 |
+| `sdd-graph migrate --repo <path>` | 把舊版本遺留在外掛根的全域 checkpoint 搬進 `<業務倉庫>/.sdd/` 之下（**CLI 命令**，沒有對應的斜線指令；見 [從舊版本遷移](#從舊版本遷移)） |
 
-指令本體只有一個控制流（`commands/start.md` 與 `commands/resume.md` 裡同一份 LOOP）：
+指令本體只有一個控制流（`commands/start.md` 與 `commands/resume.md` 裡同一份 LOOP；
+`--repo` 是選用的，沒有它就是就地模式）：
 
 ```
 LOOP:
@@ -403,12 +516,13 @@ LOOP:
 ## CLI 合約
 
 ```bash
-sdd-graph start    --task <n> --repo <url>
+sdd-graph start    --task <n> [--repo <path|url>]
 sdd-graph resume   --task <n>
 sdd-graph complete --task <n> --result <json|@file>
 sdd-graph approve  --task <n> --payload <json|@file>
 sdd-graph status   --task <n>
 sdd-graph stop     --task <n> [--force]
+sdd-graph migrate  [--repo <path>]
 sdd-graph change   --task <n>
 sdd-graph figma-diff --docs <dir> [--repo <dir>]
 ```
@@ -459,7 +573,9 @@ flowchart TD
 ```
 stderr 上會出現的錯誤碼：`invalid_arguments`、`no_checkpoint`、`audience_mismatch`、
 `invalid_result`、`invalid_payload`、`invalid_order`、`already_completed`、
-`lock_not_owned`、`not_implemented`、`internal_error`。
+`lock_not_owned`、`not_implemented`、`validation_error`、`aborted`、
+`internal_error`。（`dirty_worktree` 不在這裡 —— 它是**閘門 payload** 的 `code`，
+走 stdout 的中斷信封。）
 
 ### `sdd-graph figma-diff`：量原型跟 Figma 截圖的差異
 
@@ -502,6 +618,7 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
 |---|---|---|---|
 | `already_exists` | user | `start` 撞到舊 run | `{ action: 'resume' \| 'reset' }` |
 | `lock_conflict` | user | bootstrap | `{ action: 'wait' \| 'stop_other' }` |
+| `dirty_worktree` | user | **就地模式**的 bootstrap：工作區有已跟蹤文件的改動 | `{ action: 'proceed' \| 'abort' }` —— `proceed` = 留在當前分支上繼續 |
 | `bootstrap_failed` | user | 複製連續失敗 | `{ code, message }` |
 | `collect_prd` | user | prd 入口 | `{ prd, figma, docs }` —— 見下 |
 | `figma_missing` | user | 給了 Figma 連結但抓不到檔案 | `{ action: 'fetch' \| 'tbc' \| 'skip' }` |
@@ -517,14 +634,14 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
 | `spec_failed` | user | 規格讀不到，或沒有驗收條件 | `{ reason, message?, options: ['retry', 'abort'] }` |
 | `e2e_plan_failed` | user | E2E 計畫沒有 test id | `{ reason, message? }` |
 | `task_split_failed` | user | `tasks.md` 不合法（複雜度、id、AC 引用） | `{ reason, message? }` |
-| `tdd_rollback` / `tdd_blocked` | user | TDD 升級 | `{ action: 'wait' \| 'skip' \| 'abort' }` |
+| `tdd_rollback` / `tdd_blocked` | user | TDD 升級：**第 2 次**失敗 = `tdd_rollback`（克隆模式在此 `git reset --hard` 回到 task 的起點），**第 3 次** = `tdd_blocked`（這輪就此放棄，**不回滾**） | `{ action: 'wait' \| 'skip' \| 'abort' }` |
 | `verify_failed` | user | 四道關卡有 failed | `{ action: 'manual' \| 'skip' \| 'abort' }` |
 
 **閘門的 payload 還會多帶這些欄位**（有的話）：
 
 | 欄位 | 什麼時候 | 意思 |
 |---|---|---|
-| `rollback` | `tdd_rollback` | 程式碼到底有沒有被還原：`done`（還原了）、`skipped`（沒有 repository，沒得還原）、`failed`（有 repository 但 reset 失敗）。**後兩種情況壞掉的程式碼還在磁碟上。** |
+| `rollback` | `tdd_rollback` | 程式碼到底有沒有被還原：`done`（還原了）、`skipped`（沒有 repository，沒得還原）、`failed`（有 repository 但 reset 失敗）。**後兩種情況壞掉的程式碼還在磁碟上。**<br>**就地模式一律是 `skipped`**（就地模式不做任何自動回滾），閘門訊息會直接寫明「就地模式不做任何自動回滾，壞代碼留在你的業務倉庫裡，請手動處理」。 |
 | `previousAnswer` | 使用者的答案圖看不懂時 | 上一次那個看不懂的答案（原文）。圖會把閘門再問一次，帶著這個診斷。 |
 | `note` | 同上 | 為什麼要再問一次。 |
 
@@ -554,6 +671,40 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
 ---
 
 ## 檔案落在哪裡
+
+### 就地模式（預設）
+
+```
+<你的業務倉庫>/
+├── docs/<task>/                  ← 需求文件（**要進版本庫**，跟程式碼一起提交 —— 插件不代你 commit）
+│   ├── prd.md                    ← 使用者的需求（路徑或文字，原封不動）
+│   ├── design.md                 ← 使用者用文字描述的設計（有的話）
+│   ├── refs/*                    ← 使用者給的其他文件（有的話）
+│   ├── discovery.md
+│   ├── spec.md                   ← 含 AC-001…（規格的關卡）
+│   ├── e2e-plan.csv
+│   ├── tasks.md
+│   ├── workflow-state.json       ← 給人看的狀態鏡像（圖獨家覆寫）
+│   ├── verify/*.log              ← 四道關卡的日誌
+│   └── figma/                    ← Figma 資源
+│       ├── *.json / *.md         ← P0 資源（節點樹、token、設計說明）
+│       ├── screenshots/          ← 每個 frame 一張 png
+│       ├── prototype/            ← 靜態 HTML 原型（視覺真值來源）
+│       │   ├── index.html
+│       │   ├── <frameKey>.html
+│       │   ├── css/tokens.css
+│       │   └── assets/
+│       └── diff/                 ← 原型跟截圖的 UI diff（report.md・frames.json）
+├── <你的程式碼與測試>
+└── .sdd/                         ← 運行時狀態（**建議加進 .gitignore**）
+    ├── checkpoints.sqlite        ← 這一輪的進度（resume 的真源）
+    ├── branch-lock.json          ← 這個倉庫的分支鎖（同一時間只有一輪能跑）
+    ├── tasks/<task>/             ← 這個 task 的運行時目錄
+    └── runs/<task>/
+        └── run-metadata.json     ← runId、branch、repoUrl
+```
+
+### 克隆模式（`--repo <url>`）
 
 ```
 <外掛目錄>/
@@ -585,11 +736,16 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
     └── branch-runtime-lock.json   ← 全域分支鎖（同一時間只有一輪能跑）
 ```
 
-> **分支鎖是全域的。** 一次只有一輪能跑 —— 不管是不同分支。跑完記得
-> `sdd-graph stop --task <name>` 釋放它（`stop` 只釋放鎖，checkpoint 與工作區都留著）。
+> **就地模式的分支鎖是按倉庫的。** 同一個倉庫裡一次只有一輪能跑，不同倉庫互不影響。
+> 跑完記得 `sdd-graph stop --task <name>` 釋放它（`stop` 只釋放鎖，checkpoint 與
+> 工作區都留著）。
 >
-> **工作區可以搬到別處**：設 `SDD_GRAPH_WORKSPACE_BASE=/some/path` 就好
-> （checkpoint 與鎖**故意**不能搬 —— 它們是全域的）。
+> **克隆模式的分支鎖是全域的。** 一次只有一輪能跑 —— 不管是哪個倉庫、哪條分支。
+>
+> **就地模式的狀態根可以搬到別處**：設 `SDD_GRAPH_SDD_HOME=/some/path` 就好
+> （checkpoint 與鎖一起搬）。克隆模式的工作區也可以搬：
+> `SDD_GRAPH_WORKSPACE_BASE=/some/path`（它的 checkpoint 與鎖**故意**不能搬 ——
+> 它們是全域的）。
 
 ---
 
@@ -599,6 +755,10 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
 
 - **換一個會話接著做**：`/sdd-graph:resume --task <name>`。新會話沒有前一輪的記憶，
   它靠的是磁碟上的 sqlite 與工作單 `inputs` 裡的**絕對路徑**。
+- **要 cd 到那一輪所在的目錄**：`resume` 沒有 `--repo`，圖靠 cwd 找狀態 —— 先查
+  `<cwd 所在倉庫>/.sdd/checkpoints.sqlite`（就地模式），查不到才回落到
+  `<外掛根>/runtime/checkpoints.sqlite`（克隆模式）。兩個都沒有這一輪時回
+  `no_checkpoint`，訊息會把查過的位置列出來。
 - **同一張單被重發**：`resume` 拿到的是**同一張**工作單（role／inputs／outputs 全等），
   不是一張新的。
 - **bootstrap 不會重跑**：`resume` 走的是 checkpoint，不是 `start`，所以 repo 不會被重新複製。
@@ -613,6 +773,8 @@ sdd-graph figma-diff --docs <需求目錄> --repo <目標專案>
 | 決定 | 理由 |
 |---|---|
 | **圖決定路由，模型只做工** | 流程變成確定的；同一個狀態一定走同樣的路。可以測試、可以重播。 |
+| **checkpoint 與鎖按倉庫分開** | 舊版把狀態放在外掛根底下一份**全域**的庫：兩個倉庫裡同名 task 的 run 會互相蓋掉，A 倉庫跑任務也會鎖死 B 倉庫。搬到每個倉庫自己的 `.sdd/` 之後，一個倉庫的 run 只認自己那份。 |
+| **就地模式不做任何自動回滾** | 克隆模式裡 `git reset --hard` 砸的是一次性的副本；在你的業務倉庫裡，同一個操作會直接毀掉你正在寫的東西。開始「代替你決定哪些改動該被撤銷」，就是在替你做價值判斷 —— 失敗就停在那兒，讓人收拾。 |
 | **中斷分成 `user` 與 `host` 兩種 audience** | 「要人決定」跟「要動手做」是兩件不同的事。混在一起就會出現「用戶的答案被當成工作結果」。 |
 | **每個節點最多呼叫一次 `interrupt()`** | LangGraph 的 `interrupt()` 是依 `scratchpad.resume[idx]` 取值的，第二次呼叫會**吃掉下一個排隊的答案**。要再問一次，就用 `goto` 路由回自己，讓它在**下一次執行**重新開始。 |
 | **中斷必須是節點做的第一件事** | resume 時 LangGraph 會**重新執行整個節點**。排在 `interrupt()` 之前的副作用會跑兩次（停駐前一次、resume 後一次）。所以「先問、再寫」。 |
@@ -651,7 +813,7 @@ src/
 ├── parsers/      文件解析：AC / TBC / Q / TASK slug / E2E csv
 ├── persistence/  checkpoint（sqlite）、ArtifactStore（狀態鏡像）
 ├── prompts/      工作單模板的載入與渲染
-├── runtime/      路徑、task 名稱、分支鎖、git tag、clone
+├── runtime/      路徑、task 名稱、分支鎖、git tag、clone、運行上下文、倉庫解析
 └── state/        狀態的型別與 schema（1.1.0）
 ```
 

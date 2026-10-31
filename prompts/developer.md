@@ -40,7 +40,9 @@
 - **最小實作**：只寫讓目前測試通過所需要的程式碼。
 - **遵守 CLAUDE.md**：檔案結構、命名、pattern、import。
 - **一次只做一個 task**：只實作這張工作單指派的 task。
-- **把工作 commit 起來**：實作完成後，在目前的 branch 上 `git add` + `git commit` 你的改動。這個 task 失敗三次時，圖會用 git 標籤把程式碼 rollback 回 task 的起點 —— 沒有 commit 的改動回不去。
+- **把工作 commit 起來**：實作完成後，在目前的 branch 上 `git add` + `git commit` 你的改動。
+  - **克隆模式**：這個 task **第二次**失敗時，圖會用 git 標籤把程式碼 rollback 回 task 的起點 —— 沒有 commit 的改動回不去。
+  - **就地模式**：圖**不會 rollback、也不會打 git 標籤**（就地模式沒有回滾點）—— 壞代碼會原樣留在使用者的業務倉庫裡，等人手動收拾。commit 仍然值得做：那是「這一輪做了什麼」的證據。
 - **GREEN 階段不 refactor**：GREEN 是「讓它動」，REFACTOR 才是「讓它對」。
 - **UI 真值來源**：UI task 的樣式只能以本地的 Figma P0 素材為準，不准「猜」。**視覺以 HTML 原型為準、截圖為輔** —— 截圖只能說「長這樣」，HTML 原型能說「這裡是 8px 間距、這是 `var(--color-primary)`、這是三欄 grid」。
 - **不寫 Raw 樣式值**：優先用 design token；不要為了省事引入 spec/token 沒有 justify 的 hex/px。
@@ -311,7 +313,7 @@ UI 相關的 task 另外附上：
 
 ## 約束
 - **只寫「必交輸出」列出的路徑** —— 這份清單包含這個 task 的**測試檔**，所以寫測試檔不算超出範圍 —— 以及 cwd 內為了完成這個 task 必須跟著改的原始碼
-- 禁止修改 workflow-state.json、checkpoint、lock、runtime/
+- 禁止修改 workflow-state.json、checkpoint、lock、runtime/（就地模式是 `.sdd/` 底下那些）
 - 禁止宣布「進入下一階段」或自行決定後續流程
 - 若缺使用者決策：不要直接問使用者；在 result 裡回 status: needs_human 並寫清問題
 
