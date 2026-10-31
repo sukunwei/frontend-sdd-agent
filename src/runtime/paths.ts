@@ -72,15 +72,44 @@ export function getRepoDir(taskName: string): string {
 }
 
 /**
+ * 倉庫根的正規化路徑。
+ *
+ * **要 `realpath`**：macOS 的 `/var` 是 `/private/var` 的符號連結，
+ * 同一個倉庫會有兩種寫法——未正規化的路徑會讓顯示、比對、鎖的記錄
+ * 對不上（使用者看到的是 `/var/...`，git 看到的是 `/private/var/...`）。
+ *
+ * 拿不到就退回 `path.resolve()`：路徑不存在時不該讓呼叫端炸掉。
+ *
+ * @param repoRoot - 倉庫根目錄
+ */
+export function canonicalRepoRoot(repoRoot: string): string {
+  try {
+    return fs.realpathSync(repoRoot);
+  } catch {
+    return path.resolve(repoRoot);
+  }
+}
+
+/**
  * Requirement documents live INSIDE the cloned repo so they are committed
  * together with the code.
  * Format: <repo-dir>/docs/<requirementName>
+ *
+ * **就地模式的預設是使用者的業務倉庫根**：就地工作沒有 clone 出來的副本，
+ * 文件要寫進使用者自己的倉庫（`<repoRoot>/docs/<requirementName>`）。
+ * `getRepoDir()` 在就地模式指的是 `.sdd` 下的路徑，拿它當預設會把文件
+ * 寫到一個不是倉庫的地方去。
  *
  * @param requirementName - Normalized requirement name (== normalized task name)
  * @param repoDir - Optional explicit repo directory (fixtures/tests)
  */
 export function getDocsDir(requirementName: string, repoDir?: string): string {
-  return path.join(repoDir ?? getRepoDir(requirementName), 'docs', requirementName);
+  const base =
+    repoDir ??
+    (isLocalMode()
+      ? canonicalRepoRoot(getRunContext().repoRoot)
+      : getRepoDir(requirementName));
+  return path.join(base, 'docs', requirementName);
 }
 
 /**

@@ -5,11 +5,16 @@ import type { ErrorCode } from '../runtime/errors.js';
 import {
   cloneBranch,
   isWorktreeDirty,
-  localBranchExists,
   prepareLocalBranch,
 } from '../runtime/git-branch-manager.js';
 import { isGitRepository } from '../runtime/git-tags.js';
-import { getLockFilePath, getRepoDir, getRunMetadataPath, getTaskDir } from '../runtime/paths.js';
+import {
+  canonicalRepoRoot,
+  getLockFilePath,
+  getRepoDir,
+  getRunMetadataPath,
+  getTaskDir,
+} from '../runtime/paths.js';
 import { getRunContext, isLocalMode, setRunContext } from '../runtime/run-context.js';
 import type { RunContext } from '../runtime/run-context.js';
 import { generateBranchName, generateRunId, validateTaskName } from '../runtime/task-name.js';
@@ -61,17 +66,13 @@ export interface StartTaskOptions {
  *
  * `lock_conflict` - another task holds the global branch lock.
  * `already_exists` - the workspace of this task is already on disk.
- * `dirty_worktree` - 就地模式下工作區有已跟蹤文件的改動。`startTask()` 對
- * 同一件事回報 `errorCode: 'dirty_worktree'`（動手之前就擋下來），
- * 這個 kind 則是 bootstrap 節點開閘門時用的形狀。
  *
  * The lock conflict carries a `message`: the gate the user sees has to say
  * what is going on, not only offer two buttons.
  */
 export type StartTaskBlocker =
   | { kind: 'lock_conflict'; holderTaskName: string; message?: string }
-  | { kind: 'already_exists'; taskDir: string }
-  | { kind: 'dirty_worktree'; message: string };
+  | { kind: 'already_exists'; taskDir: string };
 
 /**
  * Characters a repository URL must not contain.
@@ -153,22 +154,22 @@ export function detectStartBlocker(
  * 就地模式下擋住這次啟動的東西。
  *
  * **判據只能來自檔案系統**：節點拿不到 checkpointer（checkpoint 只能由 CLI 側刪），
- * 所以「這個 task 之前跑過嗎」只能用讀得到的訊號回答：
- * - run-metadata 檔存在 → 之前跑過；
- * - 分支 `task/<name>` 存在 → 之前跑過（分支是就地模式的產物）。
+ * 所以「這個 task 之前跑過嗎」只能用讀得到的訊號回答：**run-metadata 檔存在**
+ * 就是之前跑過。
+ *
+ * **分支存在不算阻塞**：分支 `task/<name>` 是插件自己的工作分支，而 reset
+ * 只清插件自己的運行時狀態（`.sdd/tasks/<task>`、`.sdd/runs/<task>`）、
+ * 不刪分支（刪使用者的東西是硬紅線）。所以 reset 之後分支還在，
+ * 若把它算成阻塞，使用者就永遠起不來這個 task，而且訊息會指向一條
+ * 走不通的恢復路徑。重新開始時**複用既有的分支**才是自然的——
+ * `prepareLocalBranch()` 會切過去。
  *
  * 髒工作區不在這裡判斷：它是「這一次能不能動手」的狀態，由 `startTask()`
  * 在動手之前自己判斷（見 {@link readWorktreeDirty}）。
  */
 function detectLocalBlocker(normalizedTaskName: string): StartTaskBlocker | null {
-  const context = getRunContext();
-  const taskDir = getTaskDir(normalizedTaskName);
-
   if (fs.existsSync(getRunMetadataPath(normalizedTaskName))) {
-    return { kind: 'already_exists', taskDir };
-  }
-  if (localBranchExists(context.repoRoot, generateBranchName(normalizedTaskName))) {
-    return { kind: 'already_exists', taskDir };
+    return { kind: 'already_exists', taskDir: getTaskDir(normalizedTaskName) };
   }
   return null;
 }
@@ -417,26 +418,33 @@ async function startLocalTask(params: {
   }
 
   // Step 5: 準備分支（就地模式的「clone」）
+  // **已存在的 `task/<name>` 分支會被複用**（`prepareLocalBranch()` 切過去），
+  // 不會另外開一條：reset 之後分支還在，那是同一個 task 的工作分支。
   const prepared = prepareLocalBranch(repoRoot, branchName, {
     skipSwitch: opts.skipBranchSwitch,
   });
   if (!prepared.ok) {
     // 分支沒準備好，鎖要還回去——否則這個倉庫會一直被鎖住。
-    releaseLock(lockPath);
+    const released = releaseLock(lockPath);
     // 髒不髒看 `dirty`，不看 `errorCode`：`git_error` 被歸類成可自動重試，
     // 照抄會讓髒工作區被重試策略反反覆複地重試。
-    if (prepared.dirty === true) {
+    const primaryError =
+      prepared.dirty === true
+        ? (prepared.error ?? '工作區有未提交的改動')
+        : (prepared.error ?? 'Git operation failed');
+    const primaryCode: ErrorCode =
+      prepared.dirty === true ? 'dirty_worktree' : (prepared.errorCode ?? 'git_error');
+    if (!released.success) {
+      // 鎖沒還回去：使用者必須知道這個倉庫還被鎖著，
+      // 否則他會以為重跑一次就能繼續。
       return failure(
         { ...base, branch: prepared.branch },
-        prepared.error ?? '工作區有未提交的改動',
-        'dirty_worktree'
+        `${primaryError}. The branch lock could not be released either ` +
+          `(${released.error ?? 'unknown error'}) - the lock is still held by this task.`,
+        primaryCode
       );
     }
-    return failure(
-      { ...base, branch: prepared.branch },
-      prepared.error ?? 'Git operation failed',
-      prepared.errorCode ?? 'git_error'
-    );
+    return failure({ ...base, branch: prepared.branch }, primaryError, primaryCode);
   }
 
   // Step 6: 運行時狀態目錄（只建 .sdd/tasks/<task>，不建 repo/）
@@ -525,23 +533,6 @@ function takeBranchLock(
     };
   }
   return { ok: true };
-}
-
-/**
- * 倉庫根的正規化路徑。
- *
- * **要 `realpath`**：macOS 的 `/var` 是 `/private/var` 的符號連結，
- * 同一個倉庫會有兩種寫法——回報未正規化的路徑，顯示、比對、
- * 鎖的記錄就會對不上（使用者看到的是 `/var/...`，git 看到的是 `/private/var/...`）。
- *
- * @param repoRoot - 上下文裡的倉庫根
- */
-function canonicalRepoRoot(repoRoot: string): string {
-  try {
-    return fs.realpathSync(repoRoot);
-  } catch {
-    return path.resolve(repoRoot);
-  }
 }
 
 /**

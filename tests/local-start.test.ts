@@ -156,11 +156,25 @@ describe('local 模式的 startTask', () => {
     expect(currentBranch(repo)).toBe('main');
   });
 
-  it('local 模式不受 repoUrl 的字元黑名單約束', async () => {
-    // 本地路徑本來就有 / 與 .；remote 模式才需要那個黑名單
-    const r = await startTask('local-task', '/Users/someone/repo.git');
+  it('local 模式不受 repoUrl 的字元黑名單約束（remote 模式會拒絕的輸入）', async () => {
+    // 這個輸入 remote 模式**真的會被拒絕**（以 - 開頭 → git 會當成選項），
+    // 所以這條測試才真的區分了兩條路徑。
+    const evil = '-upload-pack=evil';
 
-    expect(r.success).toBe(true);
+    resetRunContext();
+    const remote = await startTask('remote-task', evil);
+    expect(remote.success).toBe(false);
+    expect(remote.errorCode).toBe('validation_error');
+    expect(gitCalls.filter((a) => a[0] === 'clone').length).toBe(0);
+
+    setRunContext({
+      mode: 'local',
+      repoRoot: repo,
+      sddHome: path.join(repo, '.sdd'),
+      workspaceBase: ws,
+    });
+    const local = await startTask('local-task', evil);
+    expect(local.success).toBe(true);
     expect(gitCalls.filter((a) => a[0] === 'clone').length).toBe(0);
   });
 
@@ -171,6 +185,23 @@ describe('local 模式的 startTask', () => {
     const second = await startTask('local-task', 'ignored');
     expect(second.success).toBe(false);
     expect(second.errorCode).toBe('workspace_error');
+  });
+
+  it('只有分支存在（reset 之後）時不阻塞——分支會被複用', async () => {
+    // reset 只清 .sdd 下的運行時狀態，不刪分支（刪使用者的東西是硬紅線）。
+    // 若分支存在也算阻塞，reset 之後這個 task 就永遠起不來。
+    execFileSync('git', ['-C', repo, 'branch', 'task/local-task'], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const r = await startTask('local-task', 'ignored');
+
+    expect(r.success).toBe(true);
+    expect(r.branch).toBe('task/local-task');
+    // 複用既有的分支，不另外開一條
+    expect(currentBranch(repo)).toBe('task/local-task');
+    expect(fs.existsSync(path.join(repo, '.sdd', 'runs', 'local-task', 'run-metadata.json'))).toBe(true);
   });
 
   it('reset 只刪 .sdd/ 下的東西，不動業務倉庫', async () => {
@@ -207,6 +238,15 @@ describe('local 模式的 startTask', () => {
 
     expect(() => cleanupTaskWorkspace('../../outside')).toThrow();
     expect(fs.existsSync(path.join(outside, 'keep.txt'))).toBe(true);
+  });
+
+  it('清理目標就是父目錄本身時也拒絕刪除', () => {
+    // cleanupTaskWorkspace('.') 會指向 <sddHome>/tasks —— 那是整棵樹，
+    // 不是「某個 task 的目錄」，必須拒絕。
+    fs.mkdirSync(path.join(repo, '.sdd', 'tasks', 'other-task'), { recursive: true });
+
+    expect(() => cleanupTaskWorkspace('.')).toThrow();
+    expect(fs.existsSync(path.join(repo, '.sdd', 'tasks', 'other-task'))).toBe(true);
   });
 
   it('local 模式列舉既有 task 時看 .sdd/tasks', async () => {

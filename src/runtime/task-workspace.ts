@@ -1,6 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { getTaskDir, getRepoDir, getSddHome, getWorkspaceBase } from './paths.js';
+import {
+  canonicalRepoRoot,
+  getTaskDir,
+  getRepoDir,
+  getSddHome,
+  getWorkspaceBase,
+} from './paths.js';
 import { getRunContext, isLocalMode } from './run-context.js';
 
 export interface TaskWorkspaceResult {
@@ -30,8 +36,12 @@ export interface TaskWorkspaceResult {
 export function initTaskWorkspace(taskNameNormalized: string): TaskWorkspaceResult {
   const taskDir = getTaskDir(taskNameNormalized);
   const repoDir = getRepoDir(taskNameNormalized);
-  // 就地模式的「倉庫」是使用者的業務倉庫根，不是 <task-dir>/repo。
-  const effectiveRepoDir = isLocalMode() ? getRunContext().repoRoot : repoDir;
+  // 就地模式的「倉庫」是使用者的業務倉庫根，不是 <task-dir>/repo；
+  // 用正規化後的路徑，才跟 `startTask()` 回報的 repoPath、鎖檔與
+  // run-metadata 指向同一個地方。
+  const effectiveRepoDir = isLocalMode()
+    ? canonicalRepoRoot(getRunContext().repoRoot)
+    : repoDir;
 
   try {
     // Create task directory
@@ -170,25 +180,25 @@ export function cleanupTaskWorkspace(taskNameNormalized: string): void {
 }
 
 /**
- * 目標路徑必須在 `base` 之下，否則拒絕刪除。
+ * 目標路徑必須**嚴格**在 `base` 之下，否則拒絕刪除。
  *
  * **這是最後一道閘**：清理函式是遞迴刪除，指向錯一次就是使用者的程式碼沒了。
  * 判斷用 `path.resolve`（詞法上）就夠——目標路徑都是自己組出來的，
  * 詞法上越界就是越界。
  *
+ * **嚴格**（不接受「目標就是 base 自己」）：`cleanupTaskWorkspace('.')` 會把
+ * 整個 `<sddHome>/tasks` 樹清掉——那已經不是「某個 task 的目錄」了。
+ *
  * @param base - 目標必須位於其下的根目錄
  * @param target - 要刪除的路徑
- * @throws Error when the target is outside the base
+ * @throws Error when the target is not strictly under the base
  */
 function assertUnderBase(base: string, target: string): void {
   const resolvedBase = path.resolve(base);
   const resolvedTarget = path.resolve(target);
-  if (
-    resolvedTarget !== resolvedBase &&
-    !resolvedTarget.startsWith(resolvedBase + path.sep)
-  ) {
+  if (!resolvedTarget.startsWith(resolvedBase + path.sep)) {
     throw new Error(
-      `refusing to delete "${target}": it is not under "${resolvedBase}"`
+      `refusing to delete "${target}": it is not strictly under "${resolvedBase}"`
     );
   }
 }
