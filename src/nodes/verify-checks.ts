@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getVerifyLogDirFromDocs } from '../runtime/paths.js';
+import { isLocalMode } from '../runtime/run-context.js';
 import type { VerificationCheck } from '../state/types.js';
 
 /**
@@ -23,6 +24,10 @@ import type { VerificationCheck } from '../state/types.js';
  * **Only `lint` carries `--fix`.** The other three gates report, they do not
  * repair: `tsc --noEmit` cannot write anything, and a test or an e2e run
  * that "fixed" itself would only hide the failure.
+ *
+ * **就地模式沒有 `--fix`**（見 {@link checkSpecFor}）：就地模式的 cwd 是
+ * 使用者的業務倉庫，`--fix` 會**改寫使用者的原始碼**。克隆模式的那份副本
+ * 是丟得掉的，自動修好沒有代價；就地模式有代價。
  */
 export const VERIFY_CHECKS: ReadonlyArray<{
   name: VerificationCheck['name'];
@@ -34,6 +39,34 @@ export const VERIFY_CHECKS: ReadonlyArray<{
   { name: 'test', command: ['npx', 'jest', '--passWithNoTests', '--no-coverage'], fixable: false },
   { name: 'e2e', command: ['npx', 'playwright', 'test'], fixable: false },
 ];
+
+/**
+ * 這一次要跑的那道閘（依模式）。
+ *
+ * **就地模式不帶 `--fix`**：`--fix` 會改寫使用者的原始碼，而就地模式的
+ * 工作目錄就是使用者的業務倉庫。閘門只**回報** lint 的問題，改不改由
+ * 使用者決定（閘門的訊息會說明這件事）。
+ *
+ * **不帶 `--fix` 的閘門也不算 `fixable`**：它修不了自己，重跑一次只是
+ * 把同一份錯誤再報一遍。
+ *
+ * @param name - 閘的名稱
+ * @returns 這一輪實際要跑的規格；閘不存在時為 undefined
+ */
+export function checkSpecFor(
+  name: VerificationCheck['name']
+): { name: VerificationCheck['name']; command: string[]; fixable: boolean } | undefined {
+  const spec = VERIFY_CHECKS.find((check) => check.name === name);
+  if (!spec) return undefined;
+  if (spec.name === 'lint' && isLocalMode()) {
+    return {
+      ...spec,
+      command: spec.command.filter((arg) => arg !== '--fix'),
+      fixable: false,
+    };
+  }
+  return spec;
+}
 
 /** Default budget of a single gate. */
 export const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
@@ -91,7 +124,8 @@ export async function runCheck(
   repoDir: string,
   opts: RunCheckOptions
 ): Promise<CheckResult> {
-  const spec = VERIFY_CHECKS.find((check) => check.name === name);
+  // **規格依模式**（就地模式的 lint 不帶 `--fix`）：見 {@link checkSpecFor}。
+  const spec = checkSpecFor(name);
   if (!spec) {
     throw new Error(`unknown verification check: ${name}`);
   }

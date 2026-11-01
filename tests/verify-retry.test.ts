@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCheck, runCommand, VERIFY_CHECKS } from '../src/nodes/verify-checks.js';
+import { resetRunContext, setRunContext } from '../src/runtime/run-context.js';
 import { buildVerifyGraph, readSnapshot } from './helpers/verify-graph.js';
 
 /** A temp directory that is removed again after the test. */
@@ -14,6 +15,10 @@ function withTempDir(fn: (dir: string) => Promise<void>): Promise<void> {
 }
 
 describe('verify 重試', () => {
+  afterEach(() => {
+    resetRunContext();
+  });
+
   it('四關順序固定，只有 lint 可自動修', () => {
     expect(VERIFY_CHECKS.map(c => c.name)).toEqual(['lint:ts', 'lint', 'test', 'e2e']);
     expect(VERIFY_CHECKS.filter(c => c.fixable).map(c => c.name)).toEqual(['lint']);
@@ -27,6 +32,37 @@ describe('verify 重試', () => {
       test: ['npx', 'jest', '--passWithNoTests', '--no-coverage'],
       e2e: ['npx', 'playwright', 'test'],
     });
+  });
+
+  it('就地模式的 lint 不帶 --fix（--fix 會改寫使用者的原始碼）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sdd-vlog-local-'));
+    try {
+      setRunContext({
+        mode: 'local',
+        repoRoot: dir,
+        sddHome: join(dir, '.sdd'),
+        workspaceBase: join(dir, 'tasks'),
+      });
+
+      const calls: string[][] = [];
+      const r = await runCheck('lint', dir, {
+        docsDir: dir,
+        runner: async (cmd) => {
+          calls.push(cmd);
+          return { code: 1, stdout: '', stderr: 'boom' };
+        },
+      });
+
+      // **就地模式不得改寫使用者的原始碼**：命令裡沒有 `--fix`。
+      expect(calls[0]).not.toContain('--fix');
+      expect(calls[0]).toEqual(['npx', 'eslint', '.', '--ext', '.ts,.tsx']);
+      // 沒有 `--fix` 的閘門修不了自己：不會變成 fixed，也不會重跑一次。
+      expect(r.status).toBe('failed');
+      expect(calls.length).toBe(1);
+    } finally {
+      resetRunContext();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('eslint 失敗後 --fix 通過，status 必須是 fixed 且指令帶 --fix', async () => {

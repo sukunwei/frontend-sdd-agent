@@ -5,9 +5,10 @@ import * as path from 'path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   cloneBranch,
+  currentBranchName,
   getCurrentBranch,
   getDefaultBranch,
-  getGitStatus,
+  isWorktreeDirty,
   remoteBranchExists,
 } from '../src/runtime/git-branch-manager.js';
 
@@ -79,15 +80,13 @@ describe('git branch manager（execFileSync argv 陣列，無 shell）', () => {
     expect(getDefaultBranch(remoteUrl)).toBe('main');
   });
 
-  it('getCurrentBranch 與 getGitStatus 讀取本地 repo 狀態', () => {
+  it('getCurrentBranch 讀取本地 repo 狀態', () => {
     expect(getCurrentBranch(remoteDir)).toBe('main');
-    expect(getGitStatus(remoteDir)).toEqual({
-      isClean: true,
-      currentBranch: 'main',
-      hasChanges: false,
-      stagedChanges: 0,
-      unstagedChanges: 0,
-    });
+    expect(currentBranchName(remoteDir)).toBe('main');
+    // **「髒不髒」只有一個口徑**：`--untracked-files=no`（未跟蹤檔案不算髒）。
+    // 曾經有第二個口徑（`getGitStatus`，連未跟蹤檔案都算），兩邊對不上，
+    // 而且只有測試在用 —— 它已經被刪掉，髒不髒只看 `isWorktreeDirty`。
+    expect(isWorktreeDirty(remoteDir)).toBe(false);
   });
 
   it('cloneBranch 克隆到工作區並在遠端建立新分支', () => {

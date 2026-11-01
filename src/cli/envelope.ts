@@ -41,6 +41,11 @@ export interface InterruptEnvelope {
   payload: unknown;
   /** Id of the pending interrupt, for logging. */
   interruptId?: string;
+  /**
+   * A hint for the user that is not part of the interrupt itself
+   * (e.g. `請把 /.sdd/ 加進 .gitignore`).
+   */
+  notice?: string;
 }
 
 /** Envelope of a finished command (exit code 0). */

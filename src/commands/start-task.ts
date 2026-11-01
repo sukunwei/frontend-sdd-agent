@@ -1,8 +1,23 @@
 import * as fs from 'fs';
+import * as path from 'path';
 import { acquireLock, getLock, releaseLock } from '../runtime/branch-lock.js';
 import type { ErrorCode } from '../runtime/errors.js';
-import { cloneBranch } from '../runtime/git-branch-manager.js';
-import { getLockFilePath, getRepoDir, getRunMetadataPath, getTaskDir } from '../runtime/paths.js';
+import {
+  applyLocalBranch,
+  cloneBranch,
+  DIRTY_WORKTREE_MESSAGE,
+  planLocalBranch,
+} from '../runtime/git-branch-manager.js';
+import { isGitRepository } from '../runtime/git-tags.js';
+import {
+  canonicalRepoRoot,
+  getLockFilePath,
+  getRepoDir,
+  getRunMetadataPath,
+  getTaskDir,
+} from '../runtime/paths.js';
+import { getRunContext, isLocalMode, setRunContext } from '../runtime/run-context.js';
+import type { RunContext } from '../runtime/run-context.js';
 import { generateBranchName, generateRunId, validateTaskName } from '../runtime/task-name.js';
 import { initTaskWorkspace, taskWorkspaceExists } from '../runtime/task-workspace.js';
 
@@ -16,6 +31,11 @@ import { initTaskWorkspace, taskWorkspaceExists } from '../runtime/task-workspac
  * *before* the first side effect, because the bootstrap node turns a failure
  * into an `interrupt()`: a side effect that happened before the interrupt
  * would run a second time when the node is executed again on resume.
+ *
+ * **兩種模式**（由運行上下文決定，見 `src/runtime/run-context.ts`）：
+ * - `remote`：舊的行為——把倉庫 clone 一份到外掛的 workspace 目錄裡；
+ * - `local`（就地工作）：不 clone，程式碼直接寫在使用者的業務倉庫裡，
+ *   運行時狀態寫在 `<repoRoot>/.sdd` 之下。
  */
 
 /** The outcome of a start attempt. */
@@ -36,6 +56,17 @@ export interface StartTaskResult {
 export interface StartTaskOptions {
   /** Branch lock file. Defaults to the plugin-root lock. */
   lockPath?: string;
+  /** 運行上下文；缺省讀 run-context 單例 */
+  context?: RunContext;
+  /** local 模式且使用者已批准在當前分支工作時為 true */
+  skipBranchSwitch?: boolean;
+  /**
+   * 就地模式：沿用既有的那一輪（resume），不當成「已經跑過」的阻擋。
+   *
+   * **只有使用者明確選了 resume 才會是 true**：那一輪的運行時狀態
+   * （run-metadata、runId）要留著，分支歸屬照同一條規則重算一次。
+   */
+  adoptExisting?: boolean;
 }
 
 /**
@@ -118,7 +149,34 @@ export function detectStartBlocker(
         '`stop_other` option of this gate.',
     };
   }
+  if (isLocalMode()) {
+    return detectLocalBlocker(normalizedTaskName);
+  }
   if (taskWorkspaceExists(normalizedTaskName)) {
+    return { kind: 'already_exists', taskDir: getTaskDir(normalizedTaskName) };
+  }
+  return null;
+}
+
+/**
+ * 就地模式下擋住這次啟動的東西。
+ *
+ * **判據只能來自檔案系統**：節點拿不到 checkpointer（checkpoint 只能由 CLI 側刪），
+ * 所以「這個 task 之前跑過嗎」只能用讀得到的訊號回答：**run-metadata 檔存在**
+ * 就是之前跑過。
+ *
+ * **分支存在不算阻塞**：分支 `task/<name>` 是插件自己的工作分支，而 reset
+ * 只清插件自己的運行時狀態（`.sdd/tasks/<task>`、`.sdd/runs/<task>`）、
+ * 不刪分支（刪使用者的東西是硬紅線）。所以 reset 之後分支還在，
+ * 若把它算成阻塞，使用者就永遠起不來這個 task，而且訊息會指向一條
+ * 走不通的恢復路徑。重新開始時**複用既有的分支**才是自然的——
+ * `prepareLocalBranch()` 會切過去。
+ *
+ * 髒工作區不在這裡判斷：它是「這一次能不能動手」的狀態，由 `startTask()`
+ * 在動手之前自己判斷（見 {@link planLocalBranch}）。
+ */
+function detectLocalBlocker(normalizedTaskName: string): StartTaskBlocker | null {
+  if (fs.existsSync(getRunMetadataPath(normalizedTaskName))) {
     return { kind: 'already_exists', taskDir: getTaskDir(normalizedTaskName) };
   }
   return null;
@@ -128,16 +186,24 @@ export function detectStartBlocker(
  * Start a new task: prepare the workspace, take the branch lock, clone the
  * repository.
  *
+ * **就地模式（local）走另一條路**：不 clone、不建 workspace 目錄，
+ * 改為在業務倉庫裡準備好分支、把 run-metadata 寫進 `.sdd/`。
+ *
  * @param taskNameRaw - Raw task name from the user.
- * @param repoUrl - Repository to clone.
- * @param opts - Options (the lock file the run uses).
+ * @param repoUrl - Repository to clone（local 模式不使用）。
+ * @param opts - Options (the lock file the run uses, the run context, ...).
  */
 export async function startTask(
   taskNameRaw: string,
   repoUrl: string,
   opts: StartTaskOptions = {}
 ): Promise<StartTaskResult> {
-  const lockPath = opts.lockPath ?? getLockFilePath();
+  const context = opts.context ?? getRunContext();
+  // 明確帶進來的上下文必須成為生效的上下文：路徑函式（`paths.ts`）讀的是
+  // 單例，不同步的話 task 目錄與 run-metadata 會落在兩個不同的家目錄。
+  if (opts.context) {
+    setRunContext(opts.context);
+  }
 
   // Step 1: validate the task name
   const validation = validateTaskName(taskNameRaw);
@@ -150,7 +216,24 @@ export async function startTask(
   }
   const normalizedTaskName = validation.normalized;
   const branchName = generateBranchName(normalizedTaskName);
-  const runId = generateRunId();
+  // **沿用既有的那一輪時，runId 要沿用**：那是那一輪的識別碼，
+  // 換一個新的會讓 resume 之後的紀錄對不上前一段。
+  const runId = opts.adoptExisting ? readRunId(normalizedTaskName) : generateRunId();
+
+  // 就地模式：程式碼直接寫在使用者的業務倉庫裡，流程整條不一樣。
+  if (context.mode === 'local') {
+    return startLocalTask({
+      taskNameRaw,
+      normalizedTaskName,
+      branchName,
+      runId,
+      repoUrl,
+      context,
+      opts,
+    });
+  }
+
+  const lockPath = opts.lockPath ?? getLockFilePath();
   const base = {
     taskName: taskNameRaw,
     normalizedTaskName,
@@ -186,34 +269,9 @@ export async function startTask(
   // Step 4: take the lock BEFORE the workspace is created - a lock conflict
   // must not leave a half prepared workspace behind.
   const repoPath = getRepoDir(normalizedTaskName);
-  let lockResult = acquireLock(normalizedTaskName, branchName, repoPath, runId, lockPath);
-  if (!lockResult.success && lockResult.holderTaskName === normalizedTaskName) {
-    // The lock is **ours**: the previous run of this task crashed and left it
-    // behind. `detectStartBlocker` does not call that a conflict, so the two
-    // have to agree - take the lock over instead of failing forever.
-    const released = releaseLock(lockPath);
-    if (!released.success) {
-      // The lock file could not be rewritten: the takeover is impossible and
-      // the lock is still held. Say so instead of pretending.
-      return failure(
-        base,
-        `Cannot acquire lock: the lock is held by "${normalizedTaskName}" (this task's own ` +
-          `previous run) and the lock file could not be rewritten ` +
-          `(${released.error ?? 'unknown error'}). Fix the lock file's permissions, ` +
-          'or take the lock away with the `stop_other` option of the lock gate.',
-        'lock_conflict',
-        normalizedTaskName
-      );
-    }
-    lockResult = acquireLock(normalizedTaskName, branchName, repoPath, runId, lockPath);
-  }
-  if (!lockResult.success) {
-    return failure(
-      base,
-      lockConflictMessage(lockResult.holderTaskName, normalizedTaskName),
-      'lock_conflict',
-      lockResult.holderTaskName
-    );
+  const lockOutcome = takeBranchLock(normalizedTaskName, branchName, repoPath, runId, lockPath);
+  if (!lockOutcome.ok) {
+    return failure(base, lockOutcome.error, 'lock_conflict', lockOutcome.holderTaskName);
   }
 
   // Step 5: workspace
@@ -262,6 +320,203 @@ export async function startTask(
     repoPath: cloneResult.repoPath,
     runId,
   };
+}
+
+/**
+ * 就地模式的啟動流程。
+ *
+ * **不 clone、不建 workspace 目錄**：程式碼直接寫在使用者的業務倉庫裡，
+ * 運行時狀態寫在 `<sdd-home>/`（= `<repoRoot>/.sdd`）之下。
+ *
+ * **順序與 remote 模式一樣遵守「先失敗、後動手」**：所有會失敗的檢查
+ * （不是 git 倉庫、鎖、既有 task、髒工作區）都在拿鎖與切分支之前做完。
+ *
+ * @param params - 這次啟動的各項資料
+ */
+async function startLocalTask(params: {
+  taskNameRaw: string;
+  normalizedTaskName: string;
+  branchName: string;
+  runId: string;
+  repoUrl: string;
+  context: RunContext;
+  opts: StartTaskOptions;
+}): Promise<StartTaskResult> {
+  const { taskNameRaw, normalizedTaskName, branchName, runId, repoUrl, context, opts } = params;
+  const lockPath = opts.lockPath ?? getLockFilePath();
+  const repoRoot = canonicalRepoRoot(context.repoRoot);
+  const base = {
+    taskName: taskNameRaw,
+    normalizedTaskName,
+    branch: branchName,
+    repoPath: repoRoot,
+    runId,
+  };
+
+  // Step 1: 必須是 git 倉庫——就地模式要在使用者的倉庫裡工作。
+  if (!isGitRepository(repoRoot)) {
+    return failure(
+      base,
+      `${repoRoot} is not a git repository - local mode works inside the user's own repository`,
+      'validation_error'
+    );
+  }
+
+  // Step 2: 什麼擋著？（唯讀——動手之前先看清楚）
+  const blocker = detectStartBlocker(normalizedTaskName, lockPath);
+  if (blocker?.kind === 'lock_conflict') {
+    return failure(
+      base,
+      lockConflictMessage(blocker.holderTaskName, normalizedTaskName),
+      'lock_conflict',
+      blocker.holderTaskName
+    );
+  }
+  if (blocker?.kind === 'already_exists' && !opts.adoptExisting) {
+    return failure(
+      base,
+      `Task "${normalizedTaskName}" already exists in this repository (its run metadata ` +
+        'is already there). Use resume or reset first.',
+      'already_exists'
+    );
+  }
+
+  // Step 3: 分支歸屬（唯讀的計畫）
+  //
+  // **唯一規則**（見 `planLocalBranch`）：就地模式的一輪 run 屬於
+  // `task/<name>`；使用者明確說「留在當前分支」時才例外，而且那個例外
+  // 必須是記錄下來的決定（`skipBranchSwitch`）。
+  //
+  // 工作區髒不髒也在這裡判：已跟蹤文件的改動會被帶到新分支上，
+  // 那是使用者自己正在寫的東西——插件不替他 stash，也不替他帶走。
+  const plan = planLocalBranch(repoRoot, branchName, {
+    stayOnCurrentBranch: opts.skipBranchSwitch,
+  });
+  if (plan.kind === 'dirty') {
+    return failure(base, DIRTY_WORKTREE_MESSAGE, 'dirty_worktree');
+  }
+  if (plan.kind === 'failed') {
+    return failure(base, plan.error, plan.errorCode);
+  }
+
+  // Step 4: take the lock - 與 remote 模式同一套規則
+  // **鎖裡記的是這一輪真的會在的分支**：留在當前分支時記當前分支，
+  // 記一條沒去過的分支名會誤導後續流程。
+  const plannedBranch = plan.kind === 'stay' ? plan.branch : branchName;
+  const lockOutcome = takeBranchLock(normalizedTaskName, plannedBranch, repoRoot, runId, lockPath);
+  if (!lockOutcome.ok) {
+    return failure(base, lockOutcome.error, 'lock_conflict', lockOutcome.holderTaskName);
+  }
+
+  // Step 5: 執行分支歸屬計畫（就地模式的「clone」）
+  // **已存在的 `task/<name>` 分支會被複用**（切過去），
+  // 不會另外開一條：reset 之後分支還在，那是同一個 task 的工作分支。
+  const applied = applyLocalBranch(repoRoot, plan);
+  if (!applied.ok) {
+    // 分支沒準備好，鎖要還回去——否則這個倉庫會一直被鎖住。
+    const released = releaseLock(lockPath);
+    if (!released.success) {
+      // 鎖沒還回去：使用者必須知道這個倉庫還被鎖著，
+      // 否則他會以為重跑一次就能繼續。
+      return failure(
+        base,
+        `${applied.error}. The branch lock could not be released either ` +
+          `(${released.error ?? 'unknown error'}) - the lock is still held by this task.`,
+        applied.errorCode
+      );
+    }
+    return failure(base, applied.error, applied.errorCode);
+  }
+  const preparedBranch = applied.branch;
+
+  // Step 6: 運行時狀態目錄（只建 .sdd/tasks/<task>，不建 repo/）
+  const workspaceResult = initTaskWorkspace(normalizedTaskName);
+  if (!workspaceResult.success) {
+    const released = releaseLock(lockPath);
+    if (!released.success) {
+      return failure(
+        base,
+        `${workspaceResult.error ?? 'Failed to initialize workspace'}. The branch lock ` +
+          `could not be released either (${released.error ?? 'unknown error'}) - the lock ` +
+          'is still held by this task.',
+        'workspace_error'
+      );
+    }
+    return failure(base, workspaceResult.error ?? 'Failed to initialize workspace', 'workspace_error');
+  }
+
+  // Step 7: run metadata（寫在 .sdd/runs/<task>/ 之下）
+  // **沿用既有的那一輪時，開始時間不重算**：那是同一輪的開始時間。
+  const adopted = opts.adoptExisting ? readRunMetadata(normalizedTaskName) : undefined;
+  writeRunMetadata({
+    runId,
+    taskName: normalizedTaskName,
+    branch: preparedBranch,
+    repoPath: repoRoot,
+    repoUrl,
+    startedAt: adopted?.startedAt ?? new Date().toISOString(),
+    status: 'running',
+  });
+
+  return {
+    success: true,
+    taskName: taskNameRaw,
+    normalizedTaskName,
+    branch: preparedBranch,
+    repoPath: repoRoot,
+    runId,
+  };
+}
+
+/**
+ * 拿下這次運行的分支鎖。
+ *
+ * **鎖被「自己」拿著不算衝突**：那是這個 task 上一次跑崩了留下的鎖，
+ * `detectStartBlocker` 也是同一個判準，兩邊要一致——先釋放再重拿，
+ * 而不是永遠失敗。
+ *
+ * @param taskName - 正規化的 task 名
+ * @param branchName - 這次運行的分支
+ * @param repoPath - 這次運行的倉庫路徑（寫進鎖裡）
+ * @param runId - 這次運行的 id
+ * @param lockPath - 鎖檔路徑
+ */
+function takeBranchLock(
+  taskName: string,
+  branchName: string,
+  repoPath: string,
+  runId: string,
+  lockPath: string
+): { ok: true } | { ok: false; error: string; holderTaskName?: string } {
+  let lockResult = acquireLock(taskName, branchName, repoPath, runId, lockPath);
+  if (!lockResult.success && lockResult.holderTaskName === taskName) {
+    // The lock is **ours**: the previous run of this task crashed and left it
+    // behind. `detectStartBlocker` does not call that a conflict, so the two
+    // have to agree - take the lock over instead of failing forever.
+    const released = releaseLock(lockPath);
+    if (!released.success) {
+      // The lock file could not be rewritten: the takeover is impossible and
+      // the lock is still held. Say so instead of pretending.
+      return {
+        ok: false,
+        holderTaskName: taskName,
+        error:
+          `Cannot acquire lock: the lock is held by "${taskName}" (this task's own ` +
+          `previous run) and the lock file could not be rewritten ` +
+          `(${released.error ?? 'unknown error'}). Fix the lock file's permissions, ` +
+          'or take the lock away with the `stop_other` option of the lock gate.',
+      };
+    }
+    lockResult = acquireLock(taskName, branchName, repoPath, runId, lockPath);
+  }
+  if (!lockResult.success) {
+    return {
+      ok: false,
+      holderTaskName: lockResult.holderTaskName,
+      error: lockConflictMessage(lockResult.holderTaskName, taskName),
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -324,7 +579,11 @@ interface RunMetadata {
 /** Write `run-metadata.json` - a missing file must not fail the run. */
 function writeRunMetadata(metadata: RunMetadata): void {
   try {
-    fs.writeFileSync(getRunMetadataPath(metadata.taskName), JSON.stringify(metadata, null, 2), {
+    const target = getRunMetadataPath(metadata.taskName);
+    // 就地模式的 metadata 在 `.sdd/runs/<task>/` 之下，那個目錄還不存在——
+    // 父目錄要先建起來（remote 模式裡它早就有了，mkdir 是空的）。
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o755 });
+    fs.writeFileSync(target, JSON.stringify(metadata, null, 2), {
       mode: 0o644,
     });
   } catch (err) {
@@ -337,11 +596,29 @@ function writeRunMetadata(metadata: RunMetadata): void {
  * A task without metadata (an interrupted run) gets a fresh id.
  */
 export function readRunId(normalizedTaskName: string): string {
+  const parsed = readRunMetadata(normalizedTaskName);
+  return parsed?.runId ?? generateRunId();
+}
+
+/**
+ * 既有那一輪的 run-metadata（沒有就回 undefined）。
+ *
+ * **讀不到不是錯**：中斷的 run 沒有 metadata 很正常，那種情況下呼叫端
+ * 會自己補一個新的 runId。
+ */
+function readRunMetadata(
+  normalizedTaskName: string
+): { runId?: string; startedAt?: string } | undefined {
   try {
     const raw = fs.readFileSync(getRunMetadataPath(normalizedTaskName), 'utf-8');
-    const parsed = JSON.parse(raw) as { runId?: unknown };
-    return typeof parsed.runId === 'string' && parsed.runId !== '' ? parsed.runId : generateRunId();
+    const parsed = JSON.parse(raw) as { runId?: unknown; startedAt?: unknown };
+    return {
+      ...(typeof parsed.runId === 'string' && parsed.runId !== '' ? { runId: parsed.runId } : {}),
+      ...(typeof parsed.startedAt === 'string' && parsed.startedAt !== ''
+        ? { startedAt: parsed.startedAt }
+        : {}),
+    };
   } catch {
-    return generateRunId();
+    return undefined;
   }
 }
